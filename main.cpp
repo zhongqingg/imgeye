@@ -35,6 +35,7 @@ extern const Lexilla::LexerModule lmXML;
 #define IDC_BTN_NEXT 1003
 #define IDC_BTN_RATE 1004
 #define IDC_SVG_EDIT 1005
+#define IDC_BTN_FIT  1006
 #define IDM_COPY_RGB 2001
 #define IDM_COPY_HEX 2002
 #define IDM_SAVE     2003
@@ -44,6 +45,9 @@ extern const Lexilla::LexerModule lmXML;
 #pragma comment(lib, "shlwapi.lib")
 #pragma comment(lib, "comctl32.lib")
 #pragma comment(lib, "shcore.lib")
+
+// Use Common Controls v6 (Unicode tooltips, themed controls)
+#pragma comment(linker, "/manifestdependency:\"type='win32' name='Microsoft.Windows.Common-Controls' version='6.0.0.0' processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'\"")
 
 // ---------------------------------------------------------------------------
 // Globals
@@ -94,6 +98,8 @@ static HWND        g_hBtnPrev = nullptr;
 static HWND        g_hBtnPlay = nullptr;
 static HWND        g_hBtnNext = nullptr;
 static HWND        g_hBtnRate = nullptr;
+static HWND        g_hBtnFit = nullptr;   // "best fit" button (overlay on status bar)
+static HBITMAP     g_hBtnFitBmp = nullptr;
 
 // SVG state
 static resvg_render_tree* g_svgTree = nullptr;
@@ -603,9 +609,26 @@ static void UpdateLayout(HWND hWnd) {
     if (g_hStatusBar) {
         RECT rc;
         GetClientRect(hWnd, &rc);
-        int parts[2] = { 320, -1 };
-        SendMessageW(g_hStatusBar, SB_SETPARTS, 2, (LPARAM)parts);
+        // WM_SIZE makes the status bar resize itself to span the parent bottom;
+        // read its rect AFTER so the button/parts track the current window size.
         SendMessageW(g_hStatusBar, WM_SIZE, 0, 0);
+
+        // Reserve the right side of the status bar for the "best fit" button
+        RECT sbrc; GetClientRect(g_hStatusBar, &sbrc);
+        int sbw = sbrc.right - sbrc.left;
+        const int btnW = 24, grip = 18;
+        int reserved = btnW + 12;
+        int p0 = 320;
+        int p1 = sbw - reserved - grip;
+        if (p1 < p0 + 40) p1 = p0 + 40;
+        int parts[2] = { p0, p1 };
+        SendMessageW(g_hStatusBar, SB_SETPARTS, 2, (LPARAM)parts);
+
+        // Position the fit button over the reserved area (status bar client coords)
+        if (g_hBtnFit) {
+            int sbh = sbrc.bottom - sbrc.top;
+            MoveWindow(g_hBtnFit, sbw - reserved - grip + 4, 2, btnW, sbh - 4, TRUE);
+        }
     }
     LayoutControls(hWnd);
     LayoutSvgPane(hWnd);
@@ -1029,6 +1052,69 @@ static void CenterWindow(HWND hWnd) {
 }
 
 // ---------------------------------------------------------------------------
+// "Best fit" button (drawn icon overlaid on the status bar)
+// ---------------------------------------------------------------------------
+
+// The fit button is a child of the status bar, so forward its WM_COMMAND up
+// to the main window (which owns the window procedure).
+static LRESULT CALLBACK StatusBarSubclass(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam,
+                                          UINT_PTR uId, DWORD_PTR dwRef) {
+    if (msg == WM_COMMAND) {
+        SendMessageW(GetParent(hwnd), msg, wParam, lParam);
+        return 0;
+    }
+    return DefSubclassProc(hwnd, msg, wParam, lParam);
+}
+
+static HBITMAP MakeFitIcon() {
+    const int s = 16;
+    COLORREF face = GetSysColor(COLOR_BTNFACE);
+    HDC hdc = GetDC(nullptr);
+    HDC hdcMem = CreateCompatibleDC(hdc);
+    HBITMAP bmp = CreateCompatibleBitmap(hdc, s, s);
+    if (!bmp) { DeleteDC(hdcMem); ReleaseDC(nullptr, hdc); return nullptr; }
+    HBITMAP old = (HBITMAP)SelectObject(hdcMem, bmp);
+
+    HBRUSH bg = CreateSolidBrush(face);
+    RECT rc = { 0, 0, s, s };
+    FillRect(hdcMem, &rc, bg);
+    DeleteObject(bg);
+
+    COLORREF fgCol = RGB(60, 60, 60);
+    HPEN pen = CreatePen(PS_SOLID, 1, fgCol);
+    HPEN oldPen = (HPEN)SelectObject(hdcMem, pen);
+
+    // U+26F6 style "square four corners": four L-shaped corner brackets
+    const int L = 4, T = 4, R = 11, B = 11, arm = 3;
+    // top-left
+    MoveToEx(hdcMem, L, T, nullptr); LineTo(hdcMem, L + arm, T);
+    MoveToEx(hdcMem, L, T, nullptr); LineTo(hdcMem, L, T + arm);
+    // top-right
+    MoveToEx(hdcMem, R - arm, T, nullptr); LineTo(hdcMem, R, T);
+    MoveToEx(hdcMem, R, T, nullptr); LineTo(hdcMem, R, T + arm);
+    // bottom-left
+    MoveToEx(hdcMem, L, B - arm, nullptr); LineTo(hdcMem, L, B);
+    MoveToEx(hdcMem, L, B, nullptr); LineTo(hdcMem, L + arm, B);
+    // bottom-right
+    MoveToEx(hdcMem, R - arm, B, nullptr); LineTo(hdcMem, R, B);
+    MoveToEx(hdcMem, R, B - arm, nullptr); LineTo(hdcMem, R, B);
+
+    SelectObject(hdcMem, oldPen);
+    DeleteObject(pen);
+    SelectObject(hdcMem, old);
+    DeleteDC(hdcMem);
+    ReleaseDC(nullptr, hdc);
+    return bmp;
+}
+
+static void DoBestFit(HWND hWnd) {
+    g_fitWindow = true;
+    UpdateLayout(hWnd);
+    InvalidateRect(hWnd, nullptr, FALSE);
+    UpdateStatusText();
+}
+
+// ---------------------------------------------------------------------------
 // Drag-and-drop support
 // ---------------------------------------------------------------------------
 
@@ -1092,6 +1178,36 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int nCmdShow) {
         0, 0, 0, 0, g_hWnd, (HMENU)1, hInstance, nullptr);
     if (g_hStatusBar) {
         SendMessageW(g_hStatusBar, SB_SETMINHEIGHT, 22, 0);
+        // Forward WM_COMMAND (from the fit button child) up to the main window
+        SetWindowSubclass(g_hStatusBar, StatusBarSubclass, 0, 0);
+    }
+
+    // "Best fit" button (child of the status bar, always visible)
+    g_hBtnFit = CreateWindowExW(0, L"BUTTON", L"",
+        WS_CHILD | WS_VISIBLE | BS_BITMAP | BS_FLAT | BS_PUSHBUTTON,
+        0, 0, 0, 0, g_hStatusBar, (HMENU)IDC_BTN_FIT, hInstance, nullptr);
+    if (g_hBtnFit) {
+        g_hBtnFitBmp = MakeFitIcon();
+        if (g_hBtnFitBmp) SendMessageW(g_hBtnFit, BM_SETIMAGE, IMAGE_BITMAP, (LPARAM)g_hBtnFitBmp);
+
+        // Tooltip on hover
+        HWND hTip = CreateWindowExW(0, TOOLTIPS_CLASSW, nullptr,
+            WS_POPUP | TTS_ALWAYSTIP,
+            CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT,
+            g_hWnd, nullptr, hInstance, nullptr);
+        if (hTip) {
+            TOOLINFOW ti = {};
+            ti.cbSize   = TTTOOLINFOW_V2_SIZE;
+            ti.uFlags   = TTF_IDISHWND | TTF_SUBCLASS;
+            ti.hwnd     = g_hWnd;
+            ti.uId      = (UINT_PTR)g_hBtnFit;
+            ti.lpszText = L"适配窗口大小";
+            BOOL ok = SendMessageW(hTip, TTM_ADDTOOLW, 0, (LPARAM)&ti);
+            SendMessageW(hTip, TTM_SETMAXTIPWIDTH, 300, 0);
+            HFONT hTipFont = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
+            SendMessageW(hTip, WM_SETFONT, (WPARAM)hTipFont, TRUE);
+            (void)ok;
+        }
     }
 
     // GIF control bar (hidden until a GIF is loaded)
@@ -1160,6 +1276,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int nCmdShow) {
     DestroyAcceleratorTable(hAccel);
 
     ShutdownWIC();
+    if (g_hBtnFitBmp) { DeleteObject(g_hBtnFitBmp); g_hBtnFitBmp = nullptr; }
     return (int)msg.wParam;
 }
 
@@ -1200,12 +1317,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             ZoomCenter(hWnd, 1.0 / 1.25);
             break;
         case '0':
-            if (ctrl) {
-                g_fitWindow = true;
-                UpdateLayout(hWnd);
-                InvalidateRect(hWnd, nullptr, FALSE);
-                UpdateStatusText();
-            }
+            if (ctrl) DoBestFit(hWnd);
             break;
         case '1':
             if (ctrl) {
@@ -1304,6 +1416,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             else StartPlayback(hWnd);
             return 0;
         case IDC_BTN_RATE: CycleRate(hWnd); return 0;
+        case IDC_BTN_FIT: DoBestFit(hWnd); return 0;
         case IDM_COPY_RGB:
             if (g_ctxValid) {
                 wchar_t buf[32];
