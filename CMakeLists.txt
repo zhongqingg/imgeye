@@ -11,6 +11,14 @@ endif()
 
 add_executable(imgeye WIN32 main.cpp)
 
+# resvg (SVG) - prebuilt static library
+target_include_directories(imgeye PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/third_party/resvg/include)
+target_link_libraries(imgeye PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/resvg/lib/resvg.lib
+)
+# resvg (Rust std) static-link dependencies on Windows
+target_link_libraries(imgeye PRIVATE Ws2_32 Userenv ntdll)
+
 # Use Unicode
 target_compile_definitions(imgeye PRIVATE UNICODE _UNICODE)
 
@@ -22,6 +30,9 @@ target_link_libraries(imgeye PRIVATE
     shcore
     comdlg32
     ole32
+    ws2_32
+    userenv
+    ntdll
 )
 
 # Static CRT for small portable binary

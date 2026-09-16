@@ -16,6 +16,7 @@
 #include <shellscalingapi.h>
 #include <wincodec.h>
 #include <propvarutil.h>
+#include <resvg.h>
 #include <cstdio>
 #include <cmath>
 #include <memory>
@@ -85,6 +86,15 @@ static HWND        g_hBtnPlay = nullptr;
 static HWND        g_hBtnNext = nullptr;
 static HWND        g_hBtnRate = nullptr;
 
+// SVG state
+static resvg_render_tree* g_svgTree = nullptr;
+static bool               g_isSvg   = false;
+static BYTE*              g_svgView = nullptr;
+static int                g_svgViewW = 0;
+static int                g_svgViewH = 0;
+static int                g_svgViewOffX = 0;
+static int                g_svgViewOffY = 0;
+
 // Context menu pixel
 static BYTE        g_ctxColor[4] = { 0, 0, 0, 255 };
 static bool        g_ctxValid    = false;
@@ -95,7 +105,7 @@ static int         g_fileIndex = 0;
 
 // Suffixes the software can currently display (single source of truth)
 static const wchar_t* const g_imageExts[] = {
-    L"bmp", L"png", L"jpg", L"jpeg", L"gif", L"tiff", L"tif", L"ico", L"webp"
+    L"bmp", L"png", L"jpg", L"jpeg", L"gif", L"tiff", L"tif", L"ico", L"webp", L"svg"
 };
 static const int g_imageExtCount = (int)(sizeof(g_imageExts) / sizeof(g_imageExts[0]));
 
@@ -126,6 +136,7 @@ static void      BuildFileList(const wchar_t* path);
 static bool      OpenImagePath(const wchar_t* path);
 static void      BrowseImage(HWND hWnd, int delta);
 static bool      LoadIcoPng(const wchar_t* path);
+static bool      LoadSvgFile(const wchar_t* path);
 
 // ---------------------------------------------------------------------------
 // WIC helpers
@@ -146,6 +157,15 @@ static void ShutdownWIC() {
 }
 
 static bool LoadImageFile(const wchar_t* path) {
+    // SVG is handled by resvg, not WIC
+    {
+        std::wstring spath = path;
+        size_t dot = spath.find_last_of(L'.');
+        std::wstring ext = (dot != std::wstring::npos) ? spath.substr(dot + 1) : std::wstring();
+        for (auto& c : ext) c = towlower(c);
+        if (ext == L"svg") return LoadSvgFile(path);
+    }
+
     IWICBitmapDecoder* pDecoder = nullptr;
     IWICBitmapFrameDecode* pFrame = nullptr;
     IWICFormatConverter* pConv = nullptr;
@@ -263,16 +283,62 @@ static bool LoadIcoPng(const wchar_t* path) {
     return false;
 }
 
+// ---------------------------------------------------------------------------
+// SVG: rasterized with resvg (WIC has no SVG codec)
+// ---------------------------------------------------------------------------
+
+static bool LoadSvgFile(const wchar_t* path) {
+    char utf8[1024];
+    WideCharToMultiByte(CP_UTF8, 0, path, -1, utf8, sizeof(utf8), nullptr, nullptr);
+
+    resvg_options* opt = resvg_options_create();
+    resvg_options_load_system_fonts(opt);
+
+    resvg_render_tree* tree = nullptr;
+    if (resvg_parse_tree_from_file(utf8, opt, &tree) != RESVG_OK) {
+        resvg_options_destroy(opt);
+        return false;
+    }
+    resvg_size size = resvg_get_image_size(tree);
+    if (size.width <= 0 || size.height <= 0) {
+        resvg_tree_destroy(tree);
+        resvg_options_destroy(opt);
+        return false;
+    }
+
+    CloseImage();
+    g_svgTree = tree;
+    g_isSvg = true;
+    g_imgW = (UINT)ceil((double)size.width);
+    g_imgH = (UINT)ceil((double)size.height);
+    g_currentFile = path;
+    g_fitWindow = true;
+    g_svgView = nullptr;
+    g_svgViewW = g_svgViewH = 0;
+    g_svgViewOffX = g_svgViewOffY = 0;
+
+    resvg_options_destroy(opt);
+
+    std::wstring title = g_appTitle + L" - " + path;
+    SetWindowTextW(g_hWnd, title.c_str());
+    return true;
+}
+
 static void CloseImage() {
     if (g_pConverter) { g_pConverter->Release(); g_pConverter = nullptr; }
     if (g_pFrame)    { g_pFrame->Release();      g_pFrame = nullptr; }
     if (g_pDecoder)  { g_pDecoder->Release();     g_pDecoder = nullptr; }
     if (g_pComposite) { delete[] g_pComposite; g_pComposite = nullptr; }
+    if (g_svgTree)   { resvg_tree_destroy(g_svgTree); g_svgTree = nullptr; }
+    if (g_svgView)   { delete[] g_svgView; g_svgView = nullptr; }
     if (g_hWnd) KillTimer(g_hWnd, IDT_ANIM);
+    g_isSvg = false;
     g_isGif = false;
     g_playing = false;
     g_frameCount = 1;
     g_frameIndex = 0;
+    g_svgViewW = g_svgViewH = 0;
+    g_svgViewOffX = g_svgViewOffY = 0;
     g_imgW = g_imgH = 0;
     g_currentFile.clear();
     SetWindowTextW(g_hWnd, g_appTitle.c_str());
@@ -468,7 +534,53 @@ static void Paint(HWND hWnd) {
     FillRect(hdcMem, &rc, hbrBg);
     DeleteObject(hbrBg);
 
-    if ((g_pConverter || g_pComposite) && g_imgW > 0 && g_imgH > 0) {
+    if (g_isSvg && g_svgTree) {
+        // Re-rasterize the vector SVG at the current zoom for crisp output
+        int dw = (int)(g_imgW * g_zoom); if (dw < 1) dw = 1;
+        int dh = (int)(g_imgH * g_zoom); if (dh < 1) dh = 1;
+
+        std::vector<BYTE> rgba((size_t)dw * dh * 4, 0);
+        resvg_transform t = resvg_transform_identity();
+        t.a = (float)dw / (float)g_imgW;
+        t.d = (float)dh / (float)g_imgH;
+        resvg_render(g_svgTree, t, (uint32_t)dw, (uint32_t)dh, (char*)rgba.data());
+
+        // Cache the rendered view (RGBA -> BGRA) for color picking
+        if (!g_svgView || g_svgViewW != dw || g_svgViewH != dh) {
+            delete[] g_svgView;
+            g_svgView = new BYTE[(size_t)dw * dh * 4];
+        }
+        for (size_t i = 0; i < (size_t)dw * dh; i++) {
+            g_svgView[i * 4 + 0] = rgba[i * 4 + 2];
+            g_svgView[i * 4 + 1] = rgba[i * 4 + 1];
+            g_svgView[i * 4 + 2] = rgba[i * 4 + 0];
+            g_svgView[i * 4 + 3] = rgba[i * 4 + 3];
+        }
+        g_svgViewW = dw; g_svgViewH = dh;
+        g_svgViewOffX = g_offsetX; g_svgViewOffY = g_offsetY;
+
+        BITMAPINFO bmi = {};
+        bmi.bmiHeader.biSize        = sizeof(BITMAPINFOHEADER);
+        bmi.bmiHeader.biWidth       = dw;
+        bmi.bmiHeader.biHeight      = -(int)dh; // top-down
+        bmi.bmiHeader.biPlanes      = 1;
+        bmi.bmiHeader.biBitCount    = 32;
+        bmi.bmiHeader.biCompression = BI_RGB;
+
+        void* pBits = nullptr;
+        HBITMAP hbmImg = CreateDIBSection(hdcMem, &bmi, DIB_RGB_COLORS, &pBits, nullptr, 0);
+        if (hbmImg && pBits) {
+            memcpy(pBits, g_svgView, (size_t)dw * dh * 4);
+            HDC hdcImg = CreateCompatibleDC(hdcMem);
+            HBITMAP hbmOld = (HBITMAP)SelectObject(hdcImg, hbmImg);
+            SetStretchBltMode(hdcMem, HALFTONE);
+            SetBrushOrgEx(hdcMem, 0, 0, nullptr);
+            StretchBlt(hdcMem, g_offsetX, g_offsetY, dw, dh, hdcImg, 0, 0, dw, dh, SRCCOPY);
+            SelectObject(hdcImg, hbmOld);
+            DeleteDC(hdcImg);
+            DeleteObject(hbmImg);
+        }
+    } else if ((g_pConverter || g_pComposite) && g_imgW > 0 && g_imgH > 0) {
         // Create DIB section from WIC bitmap
         BITMAPINFO bmi = {};
         bmi.bmiHeader.biSize        = sizeof(BITMAPINFOHEADER);
@@ -587,6 +699,17 @@ static void UpdateStatusText() {
 
 static bool GetPixelAt(int cx, int cy, BYTE out[4]) {
     if (g_imgW == 0 || g_imgH == 0) return false;
+    if (g_isSvg && g_svgTree) {
+        // Sample the cached rasterized view (valid only when zoom/offset match)
+        int curDw = (int)(g_imgW * g_zoom), curDh = (int)(g_imgH * g_zoom);
+        if (!g_svgView || g_svgViewW != curDw || g_svgViewH != curDh) return false;
+        if (g_svgViewOffX != g_offsetX || g_svgViewOffY != g_offsetY) return false;
+        int vx = cx - g_offsetX;
+        int vy = cy - g_offsetY;
+        if (vx < 0 || vy < 0 || vx >= curDw || vy >= curDh) return false;
+        memcpy(out, g_svgView + ((size_t)vy * curDw + vx) * 4, 4);
+        return true;
+    }
     if (!g_pConverter && !g_pComposite) return false;
     int ix = (int)((cx - g_offsetX) / g_zoom);
     int iy = (int)((cy - g_offsetY) / g_zoom);
@@ -837,6 +960,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int nCmdShow) {
     }
 
     RegisterAppClass(hInstance);
+    resvg_init_log(); // resvg one-time logging init
 
     g_hWnd = CreateWindowExW(
         WS_EX_ACCEPTFILES,
