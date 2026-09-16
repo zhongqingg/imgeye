@@ -89,6 +89,16 @@ static HWND        g_hBtnRate = nullptr;
 static BYTE        g_ctxColor[4] = { 0, 0, 0, 255 };
 static bool        g_ctxValid    = false;
 
+// Folder browsing
+static std::vector<std::wstring> g_fileList;
+static int         g_fileIndex = 0;
+
+// Suffixes the software can currently display (single source of truth)
+static const wchar_t* const g_imageExts[] = {
+    L"bmp", L"png", L"jpg", L"jpeg", L"gif", L"tiff", L"tif", L"webp"
+};
+static const int g_imageExtCount = (int)(sizeof(g_imageExts) / sizeof(g_imageExts[0]));
+
 // ---------------------------------------------------------------------------
 // Forward declarations
 // ---------------------------------------------------------------------------
@@ -111,6 +121,10 @@ static void      CycleRate(HWND hWnd);
 static void      LayoutControls(HWND hWnd);
 static bool      CopyTextToClipboard(HWND hWnd, const wchar_t* text);
 static void      ShowContextMenu(HWND hWnd, int cx, int cy);
+static bool      IsImageExtension(const std::wstring& name);
+static void      BuildFileList(const wchar_t* path);
+static bool      OpenImagePath(const wchar_t* path);
+static void      BrowseImage(HWND hWnd, int delta);
 
 // ---------------------------------------------------------------------------
 // WIC helpers
@@ -131,24 +145,34 @@ static void ShutdownWIC() {
 }
 
 static bool LoadImageFile(const wchar_t* path) {
-    CloseImage();
+    IWICBitmapDecoder* pDecoder = nullptr;
+    IWICBitmapFrameDecode* pFrame = nullptr;
+    IWICFormatConverter* pConv = nullptr;
 
-    HRESULT hr;
-    hr = g_pWICFactory->CreateDecoderFromFilename(path, nullptr, GENERIC_READ,
-         WICDecodeMetadataCacheOnLoad, &g_pDecoder);
+    HRESULT hr = g_pWICFactory->CreateDecoderFromFilename(path, nullptr, GENERIC_READ,
+         WICDecodeMetadataCacheOnLoad, &pDecoder);
     if (FAILED(hr)) return false;
 
-    hr = g_pDecoder->GetFrame(0, &g_pFrame);
-    if (FAILED(hr)) { CloseImage(); return false; }
+    hr = pDecoder->GetFrame(0, &pFrame);
+    if (FAILED(hr)) { pDecoder->Release(); return false; }
 
-    hr = g_pWICFactory->CreateFormatConverter(&g_pConverter);
-    if (FAILED(hr)) { CloseImage(); return false; }
+    hr = g_pWICFactory->CreateFormatConverter(&pConv);
+    if (FAILED(hr)) { pFrame->Release(); pDecoder->Release(); return false; }
 
-    hr = g_pConverter->Initialize(g_pFrame, GUID_WICPixelFormat32bppPBGRA,
+    hr = pConv->Initialize(pFrame, GUID_WICPixelFormat32bppPBGRA,
          WICBitmapDitherTypeNone, nullptr, 0.0, WICBitmapPaletteTypeCustom);
-    if (FAILED(hr)) { CloseImage(); return false; }
+    if (FAILED(hr)) { pConv->Release(); pFrame->Release(); pDecoder->Release(); return false; }
 
-    g_pConverter->GetSize(&g_imgW, &g_imgH);
+    UINT imgW = 0, imgH = 0;
+    pConv->GetSize(&imgW, &imgH);
+
+    // Success: replace the currently displayed image (and title) only now.
+    CloseImage();
+    g_pDecoder  = pDecoder;
+    g_pFrame    = pFrame;
+    g_pConverter = pConv;
+    g_imgW = imgW;
+    g_imgH = imgH;
     g_currentFile = path;
     g_fitWindow = true;
 
@@ -432,24 +456,36 @@ static void Paint(HWND hWnd) {
 static void OpenFile(HWND hWnd) {
     wchar_t file[MAX_PATH] = {};
     OPENFILENAMEW ofn = {};
+
+    // Build the filter from the shared, currently-supported extension list
+    std::wstring filter;
+    filter += L"All Images\0";
+    for (int i = 0; i < g_imageExtCount; i++) {
+        if (i) filter += L";";
+        filter += L"*."; filter += g_imageExts[i];
+    }
+    filter += L'\0';
+    for (int i = 0; i < g_imageExtCount; i++) {
+        std::wstring label = g_imageExts[i];
+        for (auto& c : label) c = towupper(c);
+        filter += label; filter += L" (*."; filter += g_imageExts[i]; filter += L")\0";
+        filter += L"*."; filter += g_imageExts[i]; filter += L'\0';
+    }
+    filter += L"All Files\0*.*\0";
+    filter += L'\0';
+
     ofn.lStructSize  = sizeof(ofn);
     ofn.hwndOwner    = hWnd;
-    ofn.lpstrFilter  = L"All Images\0*.bmp;*.png;*.jpg;*.jpeg;*.gif;*.tiff;*.tif;*.ico;*.webp\0"
-                       L"BMP\0*.bmp\0PNG\0*.png\0JPEG\0*.jpg;*.jpeg\0"
-                       L"GIF\0*.gif\0TIFF\0*.tiff;*.tif\0ICO\0*.ico\0WebP\0*.webp\0"
-                       L"All Files\0*.*\0";
+    ofn.lpstrFilter  = filter.c_str();
     ofn.lpstrFile    = file;
     ofn.nMaxFile     = MAX_PATH;
     ofn.Flags        = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST;
     ofn.lpstrTitle   = L"Open Image";
 
     if (GetOpenFileNameW(&ofn)) {
-        if (!LoadImageFile(file)) {
+        if (!OpenImagePath(file)) {
             MessageBoxW(hWnd, L"Failed to load image.", L"Error", MB_OK | MB_ICONERROR);
         }
-        UpdateLayout(hWnd);
-        InvalidateRect(hWnd, nullptr, FALSE);
-        UpdateStatusText();
     }
 }
 
@@ -550,6 +586,63 @@ static void ShowContextMenu(HWND hWnd, int cx, int cy) {
 }
 
 // ---------------------------------------------------------------------------
+// Folder browsing (arrow-key navigation)
+// ---------------------------------------------------------------------------
+
+static bool IsImageExtension(const std::wstring& name) {
+    size_t dot = name.find_last_of(L'.');
+    if (dot == std::wstring::npos) return false;
+    std::wstring ext = name.substr(dot + 1);
+    for (auto& c : ext) c = towlower(c);
+    for (int i = 0; i < g_imageExtCount; i++)
+        if (ext == g_imageExts[i]) return true;
+    return false;
+}
+
+static void BuildFileList(const wchar_t* path) {
+    g_fileList.clear();
+    std::wstring full = path;
+    size_t pos = full.find_last_of(L'\\');
+    if (pos == std::wstring::npos) return;
+    std::wstring folder = full.substr(0, pos + 1);
+
+    WIN32_FIND_DATAW fd;
+    HANDLE hFind = FindFirstFileW((folder + L"*").c_str(), &fd);
+    if (hFind == INVALID_HANDLE_VALUE) return;
+    do {
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+        std::wstring name = fd.cFileName;
+        if (IsImageExtension(name)) g_fileList.push_back(folder + name);
+    } while (FindNextFileW(hFind, &fd));
+    FindClose(hFind);
+
+    g_fileIndex = 0;
+    for (size_t i = 0; i < g_fileList.size(); i++) {
+        if (_wcsicmp(g_fileList[i].c_str(), path) == 0) { g_fileIndex = (int)i; break; }
+    }
+}
+
+static bool OpenImagePath(const wchar_t* path) {
+    if (!LoadImageFile(path)) return false;
+    BuildFileList(path);
+    UpdateLayout(g_hWnd);
+    InvalidateRect(g_hWnd, nullptr, FALSE);
+    UpdateStatusText();
+    return true;
+}
+
+static void BrowseImage(HWND hWnd, int delta) {
+    if (g_fileList.empty()) return;
+    int idx = g_fileIndex + delta;
+    if (idx < 0 || idx >= (int)g_fileList.size()) return;
+    if (!LoadImageFile(g_fileList[idx].c_str())) return;
+    g_fileIndex = idx;
+    UpdateLayout(hWnd);
+    InvalidateRect(hWnd, nullptr, FALSE);
+    UpdateStatusText();
+}
+
+// ---------------------------------------------------------------------------
 // Zoom at cursor
 // ---------------------------------------------------------------------------
 
@@ -636,11 +729,7 @@ static void CenterWindow(HWND hWnd) {
 static void HandleDrop(HDROP hDrop) {
     wchar_t path[MAX_PATH];
     if (DragQueryFileW(hDrop, 0, path, MAX_PATH)) {
-        if (LoadImageFile(path)) {
-            UpdateLayout(g_hWnd);
-            InvalidateRect(g_hWnd, nullptr, FALSE);
-            UpdateStatusText();
-        } else {
+        if (!OpenImagePath(path)) {
             MessageBoxW(g_hWnd, L"Failed to load image.", L"Error", MB_OK | MB_ICONERROR);
         }
     }
@@ -717,11 +806,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int nCmdShow) {
     int argc = 0;
     LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
     if (argv && argc > 1) {
-        if (LoadImageFile(argv[1])) {
-            UpdateLayout(g_hWnd);
-            InvalidateRect(g_hWnd, nullptr, FALSE);
-            UpdateStatusText();
-        }
+        OpenImagePath(argv[1]);
     }
     if (argv) LocalFree(argv);
 
@@ -794,12 +879,10 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             if (g_fullscreen) ToggleFullscreen(hWnd);
             break;
         case VK_LEFT:
-            g_offsetX += shift ? 100 : 40;
-            InvalidateRect(hWnd, nullptr, FALSE);
+            BrowseImage(hWnd, -1);
             break;
         case VK_RIGHT:
-            g_offsetX -= shift ? 100 : 40;
-            InvalidateRect(hWnd, nullptr, FALSE);
+            BrowseImage(hWnd, 1);
             break;
         case VK_UP:
             g_offsetY += shift ? 100 : 40;
