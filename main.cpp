@@ -95,7 +95,7 @@ static int         g_fileIndex = 0;
 
 // Suffixes the software can currently display (single source of truth)
 static const wchar_t* const g_imageExts[] = {
-    L"bmp", L"png", L"jpg", L"jpeg", L"gif", L"tiff", L"tif", L"webp"
+    L"bmp", L"png", L"jpg", L"jpeg", L"gif", L"tiff", L"tif", L"ico", L"webp"
 };
 static const int g_imageExtCount = (int)(sizeof(g_imageExts) / sizeof(g_imageExts[0]));
 
@@ -125,6 +125,7 @@ static bool      IsImageExtension(const std::wstring& name);
 static void      BuildFileList(const wchar_t* path);
 static bool      OpenImagePath(const wchar_t* path);
 static void      BrowseImage(HWND hWnd, int delta);
+static bool      LoadIcoPng(const wchar_t* path);
 
 // ---------------------------------------------------------------------------
 // WIC helpers
@@ -150,8 +151,16 @@ static bool LoadImageFile(const wchar_t* path) {
     IWICFormatConverter* pConv = nullptr;
 
     HRESULT hr = g_pWICFactory->CreateDecoderFromFilename(path, nullptr, GENERIC_READ,
-         WICDecodeMetadataCacheOnLoad, &pDecoder);
-    if (FAILED(hr)) return false;
+         WICDecodeMetadataCacheOnDemand, &pDecoder);
+    if (FAILED(hr)) {
+        // WIC's ICO decoder can't open PNG-compressed icons; try manual extraction
+        std::wstring spath = path;
+        size_t dot = spath.find_last_of(L'.');
+        std::wstring ext = (dot != std::wstring::npos) ? spath.substr(dot + 1) : std::wstring();
+        for (auto& c : ext) c = towlower(c);
+        if (ext == L"ico" && LoadIcoPng(path)) return true;
+        return false;
+    }
 
     hr = pDecoder->GetFrame(0, &pFrame);
     if (FAILED(hr)) { pDecoder->Release(); return false; }
@@ -193,6 +202,65 @@ static bool LoadImageFile(const wchar_t* path) {
     SetWindowTextW(g_hWnd, title.c_str());
 
     return true;
+}
+
+// ---------------------------------------------------------------------------
+// ICO fallback: WIC's ICO decoder cannot handle PNG-compressed icons, so
+// extract the embedded PNG and decode it via WIC's PNG decoder.
+// ---------------------------------------------------------------------------
+
+static bool LoadIcoPng(const wchar_t* path) {
+    HANDLE h = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return false;
+    DWORD size = GetFileSize(h, nullptr);
+    if (size < 6) { CloseHandle(h); return false; }
+    std::vector<BYTE> data(size);
+    DWORD rd = 0;
+    bool readOk = ReadFile(h, data.data(), size, &rd, nullptr) != FALSE;
+    CloseHandle(h);
+    if (!readOk) return false;
+
+    USHORT count = *(USHORT*)&data[4];
+    if (size < 6 + (size_t)count * 16) return false;
+
+    static const BYTE pngSig[8] = { 0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A };
+    for (int i = 0; i < count; i++) {
+        const BYTE* e = &data[6 + (size_t)i * 16];
+        DWORD bytesInRes = *(DWORD*)&e[8];
+        DWORD offset = *(DWORD*)&e[12];
+        if (offset + bytesInRes > size) continue;
+        if (bytesInRes < 8 || memcmp(&data[offset], pngSig, 8) != 0) continue;
+
+        IWICStream* stream = nullptr;
+        if (FAILED(g_pWICFactory->CreateStream(&stream))) return false;
+        if (FAILED(stream->InitializeFromMemory(&data[offset], bytesInRes))) { stream->Release(); return false; }
+        IWICBitmapDecoder* dec = nullptr;
+        if (FAILED(g_pWICFactory->CreateDecoderFromStream(stream, nullptr, WICDecodeMetadataCacheOnDemand, &dec))) { stream->Release(); return false; }
+        IWICBitmapFrameDecode* fr = nullptr;
+        if (FAILED(dec->GetFrame(0, &fr))) { dec->Release(); stream->Release(); return false; }
+        IWICFormatConverter* conv = nullptr;
+        if (FAILED(g_pWICFactory->CreateFormatConverter(&conv))) { fr->Release(); dec->Release(); stream->Release(); return false; }
+        if (FAILED(conv->Initialize(fr, GUID_WICPixelFormat32bppPBGRA, WICBitmapDitherTypeNone, nullptr, 0.0, WICBitmapPaletteTypeCustom))) {
+            conv->Release(); fr->Release(); dec->Release(); stream->Release(); return false;
+        }
+        UINT iw = 0, ih = 0; conv->GetSize(&iw, &ih);
+        BYTE* buf = new BYTE[(size_t)iw * ih * 4];
+        if (FAILED(conv->CopyPixels(nullptr, iw * 4, iw * ih * 4, buf))) {
+            delete[] buf; conv->Release(); fr->Release(); dec->Release(); stream->Release(); return false;
+        }
+
+        CloseImage();
+        g_pComposite = buf;
+        g_imgW = iw; g_imgH = ih;
+        g_currentFile = path;
+        g_fitWindow = true;
+        std::wstring title = g_appTitle + L" - " + path;
+        SetWindowTextW(g_hWnd, title.c_str());
+
+        conv->Release(); fr->Release(); dec->Release(); stream->Release();
+        return true;
+    }
+    return false;
 }
 
 static void CloseImage() {
@@ -400,7 +468,7 @@ static void Paint(HWND hWnd) {
     FillRect(hdcMem, &rc, hbrBg);
     DeleteObject(hbrBg);
 
-    if (g_pConverter && g_imgW > 0 && g_imgH > 0) {
+    if ((g_pConverter || g_pComposite) && g_imgW > 0 && g_imgH > 0) {
         // Create DIB section from WIC bitmap
         BITMAPINFO bmi = {};
         bmi.bmiHeader.biSize        = sizeof(BITMAPINFOHEADER);
@@ -418,7 +486,7 @@ static void Paint(HWND hWnd) {
             UINT cbSize   = cbStride * g_imgH;
             const BYTE* srcBits;
             std::vector<BYTE> tmp;
-            if (g_isGif && g_pComposite) {
+            if (g_pComposite) {
                 srcBits = g_pComposite;
             } else {
                 tmp.resize(cbSize);
@@ -523,7 +591,7 @@ static bool GetPixelAt(int cx, int cy, BYTE out[4]) {
     int ix = (int)((cx - g_offsetX) / g_zoom);
     int iy = (int)((cy - g_offsetY) / g_zoom);
     if (ix < 0 || iy < 0 || ix >= (int)g_imgW || iy >= (int)g_imgH) return false;
-    if (g_isGif && g_pComposite) {
+    if (g_pComposite) {
         memcpy(out, g_pComposite + ((size_t)iy * g_imgW + ix) * 4, 4);
     } else {
         WICRect rc = { ix, iy, 1, 1 };
