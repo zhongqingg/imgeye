@@ -16,8 +16,14 @@ target_include_directories(imgeye PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/third_part
 target_link_libraries(imgeye PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/third_party/resvg/lib/resvg.lib
 )
+# Scintilla (editor core) + Lexilla XML lexer - prebuilt static libraries
+target_include_directories(imgeye PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/third_party/scintilla/include)
+target_link_libraries(imgeye PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/scintilla/lib/libscintilla.lib
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/scintilla/lib/liblexilla_xml.lib
+)
 # resvg (Rust std) static-link dependencies on Windows
-target_link_libraries(imgeye PRIVATE Ws2_32 Userenv ntdll)
+target_link_libraries(imgeye PRIVATE Ws2_32 Userenv ntdll imm32)
 
 # Use Unicode
 target_compile_definitions(imgeye PRIVATE UNICODE _UNICODE)

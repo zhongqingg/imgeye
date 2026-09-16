@@ -17,7 +17,14 @@
 #include <wincodec.h>
 #include <propvarutil.h>
 #include <resvg.h>
+#include <Scintilla.h>
+#include <ILexer.h>
+#include <SciLexer.h>
+#include <LexerModule.h>
 #include <cstdio>
+
+// lmXML is defined at global scope in LexHTML.cxx (which uses `using namespace Lexilla`)
+extern const Lexilla::LexerModule lmXML;
 #include <cmath>
 #include <memory>
 #include <string>
@@ -357,30 +364,24 @@ static void LayoutSvgPane(HWND hWnd) {
 static void LoadSvgIntoEdit(const wchar_t* path) {
     if (!g_hSvgEdit) return;
     HANDLE h = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
-    if (h == INVALID_HANDLE_VALUE) { SetWindowTextW(g_hSvgEdit, L""); return; }
+    if (h == INVALID_HANDLE_VALUE) { SendMessageW(g_hSvgEdit, SCI_SETTEXT, 0, (LPARAM)""); return; }
     DWORD size = GetFileSize(h, nullptr);
     std::string data(size, 0);
     DWORD rd = 0;
     if (size) ReadFile(h, &data[0], size, &rd, nullptr);
     CloseHandle(h);
-
-    int wlen = MultiByteToWideChar(CP_UTF8, 0, data.data(), (int)rd, nullptr, 0);
-    std::wstring wtext(wlen, 0);
-    if (wlen) MultiByteToWideChar(CP_UTF8, 0, data.data(), (int)rd, &wtext[0], wlen);
-    SetWindowTextW(g_hSvgEdit, wtext.c_str());
+    data.resize(rd);
+    SendMessageW(g_hSvgEdit, SCI_SETTEXT, 0, (LPARAM)data.c_str());
 }
 
 static void SaveSvg(HWND hWnd) {
     if (!g_isSvg || !g_hSvgEdit) return;
 
-    int len = GetWindowTextLengthW(g_hSvgEdit);
-    std::wstring wtext(len + 1, 0);
-    GetWindowTextW(g_hSvgEdit, &wtext[0], len + 1);
-    wtext.resize(len);
-
-    int u8len = WideCharToMultiByte(CP_UTF8, 0, wtext.c_str(), len, nullptr, 0, nullptr, nullptr);
-    std::string u8(u8len, 0);
-    if (u8len) WideCharToMultiByte(CP_UTF8, 0, wtext.c_str(), len, &u8[0], u8len, nullptr, nullptr);
+    Sci_Position len = SendMessageW(g_hSvgEdit, SCI_GETLENGTH, 0, 0);
+    std::string u8((size_t)len, 0);
+    if (len > 0)
+        SendMessageW(g_hSvgEdit, SCI_GETTEXT, len + 1, (LPARAM)&u8[0]);
+    u8.resize(len);
 
     // Re-parse to validate and render
     resvg_options* opt = resvg_options_create();
@@ -1086,15 +1087,31 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int nCmdShow) {
     g_hBtnRate = CreateWindowExW(0, L"BUTTON", L"1x",
         bstyle, 0, 0, 0, 0, g_hWnd, (HMENU)IDC_BTN_RATE, hInstance, nullptr);
 
-    // SVG source edit pane (hidden until an SVG is opened)
-    g_hSvgEdit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", nullptr,
-        WS_CHILD | WS_VISIBLE | WS_VSCROLL | WS_HSCROLL | ES_MULTILINE | ES_AUTOVSCROLL | ES_AUTOHSCROLL | WS_TABSTOP,
+    // SVG source editor pane: Scintilla (hidden until an SVG is opened)
+    Scintilla_RegisterClasses(hInstance);
+    g_hSvgEdit = CreateWindowExA(WS_EX_CLIENTEDGE, "Scintilla", nullptr,
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP,
         0, 0, 0, 0, g_hWnd, (HMENU)IDC_SVG_EDIT, hInstance, nullptr);
     if (g_hSvgEdit) {
-        HFONT hMono = CreateFontW(16, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
-            DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
-            DEFAULT_QUALITY, FIXED_PITCH, L"Consolas");
-        SendMessageW(g_hSvgEdit, WM_SETFONT, (WPARAM)hMono, TRUE);
+        // Word wrap
+        SendMessageW(g_hSvgEdit, SCI_SETWRAPMODE, SC_WRAP_WORD, 0);
+        // XML lexer (linked directly from Lexilla, avoiding the full registry)
+        Scintilla::ILexer5* xmlLexer = lmXML.Create();
+        if (xmlLexer) SendMessageW(g_hSvgEdit, SCI_SETILEXER, 0, (LPARAM)xmlLexer);
+        // Default style (light theme)
+        SendMessageW(g_hSvgEdit, SCI_STYLESETFONT, STYLE_DEFAULT, (LPARAM)"Consolas");
+        SendMessageW(g_hSvgEdit, SCI_STYLESETSIZE, STYLE_DEFAULT, 16);
+        SendMessageW(g_hSvgEdit, SCI_STYLESETFORE, STYLE_DEFAULT, 0x000000);
+        SendMessageW(g_hSvgEdit, SCI_STYLECLEARALL, 0, 0);
+        // XML token colors
+        SendMessageW(g_hSvgEdit, SCI_STYLESETFORE, SCE_H_TAG, 0x0000CC);          // tag
+        SendMessageW(g_hSvgEdit, SCI_STYLESETFORE, SCE_H_ATTRIBUTE, 0x9900AA);    // attribute
+        SendMessageW(g_hSvgEdit, SCI_STYLESETFORE, SCE_H_ATTRIBUTEUNKNOWN, 0x9900AA);
+        SendMessageW(g_hSvgEdit, SCI_STYLESETFORE, SCE_H_VALUE, 0x008800);        // value
+        SendMessageW(g_hSvgEdit, SCI_STYLESETFORE, SCE_H_COMMENT, 0x808080);      // comment
+        SendMessageW(g_hSvgEdit, SCI_STYLESETFORE, SCE_H_TAGUNKNOWN, 0x0000CC);
+        SendMessageW(g_hSvgEdit, SCI_STYLESETFORE, SCE_H_CDATA, 0x000000);
+        SendMessageW(g_hSvgEdit, SCI_SETUNDOCOLLECTION, 1, 0);
         ShowWindow(g_hSvgEdit, SW_HIDE);
     }
 
