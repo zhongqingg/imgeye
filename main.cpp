@@ -338,6 +338,8 @@ static void UpdateLayout(HWND hWnd) {
     if (g_hStatusBar) {
         RECT rc;
         GetClientRect(hWnd, &rc);
+        int parts[2] = { 320, -1 };
+        SendMessageW(g_hStatusBar, SB_SETPARTS, 2, (LPARAM)parts);
         SendMessageW(g_hStatusBar, WM_SIZE, 0, 0);
     }
     LayoutControls(hWnd);
@@ -469,6 +471,36 @@ static void UpdateStatusText() {
     if (g_hBtnNext) ShowWindow(g_hBtnNext, show);
     if (g_hBtnRate) ShowWindow(g_hBtnRate, show);
     LayoutControls(g_hWnd);
+}
+
+static bool GetPixelAt(int cx, int cy, BYTE out[4]) {
+    if (g_imgW == 0 || g_imgH == 0) return false;
+    if (!g_pConverter && !g_pComposite) return false;
+    int ix = (int)((cx - g_offsetX) / g_zoom);
+    int iy = (int)((cy - g_offsetY) / g_zoom);
+    if (ix < 0 || iy < 0 || ix >= (int)g_imgW || iy >= (int)g_imgH) return false;
+    if (g_isGif && g_pComposite) {
+        memcpy(out, g_pComposite + ((size_t)iy * g_imgW + ix) * 4, 4);
+    } else {
+        WICRect rc = { ix, iy, 1, 1 };
+        g_pConverter->CopyPixels(&rc, 4, 4, out);
+    }
+    return true;
+}
+
+static void SetCursorStatus(int cx, int cy) {
+    if (!g_hStatusBar) return;
+    BYTE px[4];
+    if (!GetPixelAt(cx, cy, px)) {
+        SendMessageW(g_hStatusBar, SB_SETTEXTW, 1, (LPARAM)L"");
+        return;
+    }
+    int ix = (int)((cx - g_offsetX) / g_zoom);
+    int iy = (int)((cy - g_offsetY) / g_zoom);
+    wchar_t buf[160];
+    swprintf_s(buf, L"(%d, %d)  R: %d G: %d B: %d A: %d",
+               ix, iy, px[2], px[1], px[0], px[3]);
+    SendMessageW(g_hStatusBar, SB_SETTEXTW, 1, (LPARAM)buf);
 }
 
 // ---------------------------------------------------------------------------
@@ -755,13 +787,14 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     }
 
     case WM_MOUSEMOVE: {
+        int mx = GET_X_LPARAM(lParam);
+        int my = GET_Y_LPARAM(lParam);
         if (g_dragging) {
-            int mx = GET_X_LPARAM(lParam);
-            int my = GET_Y_LPARAM(lParam);
             g_offsetX = g_dragOffX + (mx - g_dragStart.x);
             g_offsetY = g_dragOffY + (my - g_dragStart.y);
             InvalidateRect(hWnd, nullptr, FALSE);
         }
+        SetCursorStatus(mx, my);
         return 0;
     }
 
