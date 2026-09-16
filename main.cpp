@@ -1108,6 +1108,7 @@ static HBITMAP MakeFitIcon() {
 }
 
 static void DoBestFit(HWND hWnd) {
+    SetFocus(hWnd); // return focus to the image so arrow keys browse images
     g_fitWindow = true;
     UpdateLayout(hWnd);
     InvalidateRect(hWnd, nullptr, FALSE);
