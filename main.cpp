@@ -743,7 +743,27 @@ static void Paint(HWND hWnd) {
                 g_pConverter->CopyPixels(nullptr, cbStride, cbSize, (BYTE*)tmp.data());
                 srcBits = tmp.data();
             }
-            memcpy(pBits, srcBits, cbSize);
+            // Composite premultiplied BGRA over a light checkerboard so fully
+            // transparent (alpha=0) pixels are distinguishable from real black.
+            BYTE* dstBits = (BYTE*)pBits;
+            for (UINT y = 0; y < g_imgH; y++) {
+                for (UINT x = 0; x < g_imgW; x++) {
+                    size_t i = ((size_t)y * g_imgW + x) * 4;
+                    BYTE b = srcBits[i + 0], g = srcBits[i + 1];
+                    BYTE r = srcBits[i + 2], a = srcBits[i + 3];
+                    if (a == 255) {
+                        dstBits[i + 0] = b; dstBits[i + 1] = g;
+                        dstBits[i + 2] = r; dstBits[i + 3] = 255;
+                    } else {
+                        BYTE bc = (((x / 8) + (y / 8)) & 1) ? (BYTE)200 : (BYTE)255;
+                        BYTE invA = (BYTE)(255 - a);
+                        dstBits[i + 0] = (BYTE)(b + bc * invA / 255);
+                        dstBits[i + 1] = (BYTE)(g + bc * invA / 255);
+                        dstBits[i + 2] = (BYTE)(r + bc * invA / 255);
+                        dstBits[i + 3] = 255;
+                    }
+                }
+            }
 
             // Draw with StretchBlt from a DC that has the DIB selected
             HDC hdcImg = CreateCompatibleDC(hdcMem);
