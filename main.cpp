@@ -98,7 +98,8 @@ static HWND        g_hBtnRate = nullptr;
 // SVG state
 static resvg_render_tree* g_svgTree = nullptr;
 static bool               g_isSvg   = false;
-static BYTE*              g_svgView = nullptr;
+static BYTE*              g_svgView = nullptr; // composited over checkerboard (display)
+static BYTE*              g_svgRaw  = nullptr; // raw premultiplied BGRA (color picking)
 static int                g_svgViewW = 0;
 static int                g_svgViewH = 0;
 static int                g_svgViewOffX = 0;
@@ -328,6 +329,7 @@ static bool LoadSvgFile(const wchar_t* path) {
     g_currentFile = path;
     g_fitWindow = true;
     g_svgView = nullptr;
+    g_svgRaw = nullptr;
     g_svgViewW = g_svgViewH = 0;
     g_svgViewOffX = g_svgViewOffY = 0;
 
@@ -426,6 +428,7 @@ static void CloseImage() {
     if (g_pComposite) { delete[] g_pComposite; g_pComposite = nullptr; }
     if (g_svgTree)   { resvg_tree_destroy(g_svgTree); g_svgTree = nullptr; }
     if (g_svgView)   { delete[] g_svgView; g_svgView = nullptr; }
+    if (g_svgRaw)    { delete[] g_svgRaw; g_svgRaw = nullptr; }
     if (g_hSvgEdit)  ShowWindow(g_hSvgEdit, SW_HIDE);
     if (g_hWnd) KillTimer(g_hWnd, IDT_ANIM);
     g_isSvg = false;
@@ -642,16 +645,31 @@ static void Paint(HWND hWnd) {
         t.d = (float)dh / (float)g_imgH;
         resvg_render(g_svgTree, t, (uint32_t)dw, (uint32_t)dh, (char*)rgba.data());
 
-        // Cache the rendered view (RGBA -> BGRA) for color picking
+        // Cache rendered views (RGBA -> BGRA): raw for picking, composite for display
         if (!g_svgView || g_svgViewW != dw || g_svgViewH != dh) {
             delete[] g_svgView;
             g_svgView = new BYTE[(size_t)dw * dh * 4];
         }
+        if (!g_svgRaw || g_svgViewW != dw || g_svgViewH != dh) {
+            delete[] g_svgRaw;
+            g_svgRaw = new BYTE[(size_t)dw * dh * 4];
+        }
         for (size_t i = 0; i < (size_t)dw * dh; i++) {
-            g_svgView[i * 4 + 0] = rgba[i * 4 + 2];
-            g_svgView[i * 4 + 1] = rgba[i * 4 + 1];
-            g_svgView[i * 4 + 2] = rgba[i * 4 + 0];
-            g_svgView[i * 4 + 3] = rgba[i * 4 + 3];
+            BYTE r = rgba[i * 4 + 0], g = rgba[i * 4 + 1];
+            BYTE b = rgba[i * 4 + 2], a = rgba[i * 4 + 3];
+            // Raw premultiplied BGRA (alpha preserved for color picking)
+            g_svgRaw[i * 4 + 0] = b;
+            g_svgRaw[i * 4 + 1] = g;
+            g_svgRaw[i * 4 + 2] = r;
+            g_svgRaw[i * 4 + 3] = a;
+            // Composite over a light checkerboard (premultiplied-over)
+            int x = (int)(i % dw), y = (int)(i / dw);
+            BYTE bc = (((x / 8) + (y / 8)) & 1) ? (BYTE)200 : (BYTE)255;
+            BYTE invA = (BYTE)(255 - a);
+            g_svgView[i * 4 + 0] = (BYTE)(b + bc * invA / 255);
+            g_svgView[i * 4 + 1] = (BYTE)(g + bc * invA / 255);
+            g_svgView[i * 4 + 2] = (BYTE)(r + bc * invA / 255);
+            g_svgView[i * 4 + 3] = 255;
         }
         g_svgViewW = dw; g_svgViewH = dh;
         g_svgViewOffX = g_offsetX; g_svgViewOffY = g_offsetY;
@@ -797,14 +815,14 @@ static void UpdateStatusText() {
 static bool GetPixelAt(int cx, int cy, BYTE out[4]) {
     if (g_imgW == 0 || g_imgH == 0) return false;
     if (g_isSvg && g_svgTree) {
-        // Sample the cached rasterized view (valid only when zoom/offset match)
+        // Sample the cached raw raster (valid only when zoom/offset match)
         int curDw = (int)(g_imgW * g_zoom), curDh = (int)(g_imgH * g_zoom);
-        if (!g_svgView || g_svgViewW != curDw || g_svgViewH != curDh) return false;
+        if (!g_svgRaw || g_svgViewW != curDw || g_svgViewH != curDh) return false;
         if (g_svgViewOffX != g_offsetX || g_svgViewOffY != g_offsetY) return false;
         int vx = cx - g_offsetX;
         int vy = cy - g_offsetY;
         if (vx < 0 || vy < 0 || vx >= curDw || vy >= curDh) return false;
-        memcpy(out, g_svgView + ((size_t)vy * curDw + vx) * 4, 4);
+        memcpy(out, g_svgRaw + ((size_t)vy * curDw + vx) * 4, 4);
         return true;
     }
     if (!g_pConverter && !g_pComposite) return false;
