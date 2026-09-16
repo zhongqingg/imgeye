@@ -348,7 +348,7 @@ static bool LoadSvgFile(const wchar_t* path) {
 static void GetImageArea(HWND hWnd, RECT* rc) {
     GetClientRect(hWnd, rc);
     if (g_isSvg && g_hSvgEdit) {
-        rc->right = rc->left + (rc->right - rc->left) * 3 / 4;
+        rc->right = rc->left + (rc->right - rc->left) / 2;
     }
 }
 
@@ -357,7 +357,7 @@ static void LayoutSvgPane(HWND hWnd) {
     RECT rc; GetClientRect(hWnd, &rc);
     int sbh = 0;
     if (g_hStatusBar) { RECT sbr; GetWindowRect(g_hStatusBar, &sbr); sbh = sbr.bottom - sbr.top; }
-    int splitX = rc.left + (rc.right - rc.left) * 3 / 4;
+    int splitX = rc.left + (rc.right - rc.left) / 2;
     MoveWindow(g_hSvgEdit, splitX + 2, rc.top, rc.right - splitX - 2, rc.bottom - sbh, TRUE);
 }
 
@@ -1062,7 +1062,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int nCmdShow) {
     g_hWnd = CreateWindowExW(
         WS_EX_ACCEPTFILES,
         L"ImgEyeWnd", g_appTitle.c_str(),
-        WS_OVERLAPPEDWINDOW,
+        WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
         CW_USEDEFAULT, CW_USEDEFAULT, 1000, 700,
         nullptr, nullptr, hInstance, nullptr);
 
@@ -1100,7 +1100,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int nCmdShow) {
         if (xmlLexer) SendMessageW(g_hSvgEdit, SCI_SETILEXER, 0, (LPARAM)xmlLexer);
         // Default style (light theme)
         SendMessageW(g_hSvgEdit, SCI_STYLESETFONT, STYLE_DEFAULT, (LPARAM)"Consolas");
-        SendMessageW(g_hSvgEdit, SCI_STYLESETSIZE, STYLE_DEFAULT, 16);
+        SendMessageW(g_hSvgEdit, SCI_STYLESETSIZE, STYLE_DEFAULT, 13);
         SendMessageW(g_hSvgEdit, SCI_STYLESETFORE, STYLE_DEFAULT, 0x000000);
         SendMessageW(g_hSvgEdit, SCI_STYLECLEARALL, 0, 0);
         // XML token colors
@@ -1233,6 +1233,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     }
 
     case WM_LBUTTONDOWN: {
+        SetFocus(hWnd); // blur the SVG edit pane so arrow keys browse images
         SetCapture(hWnd);
         g_dragging = true;
         g_dragStart.x = GET_X_LPARAM(lParam);
