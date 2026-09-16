@@ -27,8 +27,10 @@
 #define IDC_BTN_PLAY 1002
 #define IDC_BTN_NEXT 1003
 #define IDC_BTN_RATE 1004
+#define IDC_SVG_EDIT 1005
 #define IDM_COPY_RGB 2001
 #define IDM_COPY_HEX 2002
+#define IDM_SAVE     2003
 #define IDT_ANIM     2
 
 #pragma comment(lib, "windowscodecs.lib")
@@ -94,6 +96,7 @@ static int                g_svgViewW = 0;
 static int                g_svgViewH = 0;
 static int                g_svgViewOffX = 0;
 static int                g_svgViewOffY = 0;
+static HWND               g_hSvgEdit = nullptr; // editable SVG source pane
 
 // Context menu pixel
 static BYTE        g_ctxColor[4] = { 0, 0, 0, 255 };
@@ -137,6 +140,10 @@ static bool      OpenImagePath(const wchar_t* path);
 static void      BrowseImage(HWND hWnd, int delta);
 static bool      LoadIcoPng(const wchar_t* path);
 static bool      LoadSvgFile(const wchar_t* path);
+static void      GetImageArea(HWND hWnd, RECT* rc);
+static void      LayoutSvgPane(HWND hWnd);
+static void      LoadSvgIntoEdit(const wchar_t* path);
+static void      SaveSvg(HWND hWnd);
 
 // ---------------------------------------------------------------------------
 // WIC helpers
@@ -319,9 +326,96 @@ static bool LoadSvgFile(const wchar_t* path) {
 
     resvg_options_destroy(opt);
 
+    LoadSvgIntoEdit(path);
+    if (g_hSvgEdit) ShowWindow(g_hSvgEdit, SW_SHOW);
+
     std::wstring title = g_appTitle + L" - " + path;
     SetWindowTextW(g_hWnd, title.c_str());
     return true;
+}
+
+// ---------------------------------------------------------------------------
+// SVG split pane helpers (image left 3 : source right 1)
+// ---------------------------------------------------------------------------
+
+static void GetImageArea(HWND hWnd, RECT* rc) {
+    GetClientRect(hWnd, rc);
+    if (g_isSvg && g_hSvgEdit) {
+        rc->right = rc->left + (rc->right - rc->left) * 3 / 4;
+    }
+}
+
+static void LayoutSvgPane(HWND hWnd) {
+    if (!g_hSvgEdit || !g_isSvg) return;
+    RECT rc; GetClientRect(hWnd, &rc);
+    int sbh = 0;
+    if (g_hStatusBar) { RECT sbr; GetWindowRect(g_hStatusBar, &sbr); sbh = sbr.bottom - sbr.top; }
+    int splitX = rc.left + (rc.right - rc.left) * 3 / 4;
+    MoveWindow(g_hSvgEdit, splitX + 2, rc.top, rc.right - splitX - 2, rc.bottom - sbh, TRUE);
+}
+
+static void LoadSvgIntoEdit(const wchar_t* path) {
+    if (!g_hSvgEdit) return;
+    HANDLE h = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+    if (h == INVALID_HANDLE_VALUE) { SetWindowTextW(g_hSvgEdit, L""); return; }
+    DWORD size = GetFileSize(h, nullptr);
+    std::string data(size, 0);
+    DWORD rd = 0;
+    if (size) ReadFile(h, &data[0], size, &rd, nullptr);
+    CloseHandle(h);
+
+    int wlen = MultiByteToWideChar(CP_UTF8, 0, data.data(), (int)rd, nullptr, 0);
+    std::wstring wtext(wlen, 0);
+    if (wlen) MultiByteToWideChar(CP_UTF8, 0, data.data(), (int)rd, &wtext[0], wlen);
+    SetWindowTextW(g_hSvgEdit, wtext.c_str());
+}
+
+static void SaveSvg(HWND hWnd) {
+    if (!g_isSvg || !g_hSvgEdit) return;
+
+    int len = GetWindowTextLengthW(g_hSvgEdit);
+    std::wstring wtext(len + 1, 0);
+    GetWindowTextW(g_hSvgEdit, &wtext[0], len + 1);
+    wtext.resize(len);
+
+    int u8len = WideCharToMultiByte(CP_UTF8, 0, wtext.c_str(), len, nullptr, 0, nullptr, nullptr);
+    std::string u8(u8len, 0);
+    if (u8len) WideCharToMultiByte(CP_UTF8, 0, wtext.c_str(), len, &u8[0], u8len, nullptr, nullptr);
+
+    // Re-parse to validate and render
+    resvg_options* opt = resvg_options_create();
+    resvg_options_load_system_fonts(opt);
+    resvg_render_tree* tree = nullptr;
+    if (resvg_parse_tree_from_data(u8.data(), u8.size(), opt, &tree) != RESVG_OK) {
+        resvg_options_destroy(opt);
+        MessageBoxW(hWnd, L"SVG 语法错误，无法渲染。", L"Error", MB_OK | MB_ICONERROR);
+        return;
+    }
+    resvg_size size = resvg_get_image_size(tree);
+    resvg_options_destroy(opt);
+    if (size.width <= 0 || size.height <= 0) {
+        resvg_tree_destroy(tree);
+        MessageBoxW(hWnd, L"SVG 尺寸无效。", L"Error", MB_OK | MB_ICONERROR);
+        return;
+    }
+
+    // Save to disk
+    HANDLE h = CreateFileW(g_currentFile.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, 0, nullptr);
+    if (h != INVALID_HANDLE_VALUE) {
+        DWORD wr = 0;
+        WriteFile(h, u8.data(), (DWORD)u8.size(), &wr, nullptr);
+        CloseHandle(h);
+    }
+
+    // Swap in the new tree and re-render
+    if (g_svgTree) resvg_tree_destroy(g_svgTree);
+    g_svgTree = tree;
+    g_imgW = (UINT)ceil((double)size.width);
+    g_imgH = (UINT)ceil((double)size.height);
+    g_fitWindow = true;
+    UpdateLayout(hWnd);
+    InvalidateRect(hWnd, nullptr, FALSE);
+    UpdateStatusText();
 }
 
 static void CloseImage() {
@@ -331,6 +425,7 @@ static void CloseImage() {
     if (g_pComposite) { delete[] g_pComposite; g_pComposite = nullptr; }
     if (g_svgTree)   { resvg_tree_destroy(g_svgTree); g_svgTree = nullptr; }
     if (g_svgView)   { delete[] g_svgView; g_svgView = nullptr; }
+    if (g_hSvgEdit)  ShowWindow(g_hSvgEdit, SW_HIDE);
     if (g_hWnd) KillTimer(g_hWnd, IDT_ANIM);
     g_isSvg = false;
     g_isGif = false;
@@ -485,7 +580,7 @@ static void LayoutControls(HWND hWnd) {
 
 static void FitToWindow(HWND hWnd) {
     RECT rc;
-    GetClientRect(hWnd, &rc);
+    GetImageArea(hWnd, &rc);
     int cw = rc.right - rc.left;
     int ch = rc.bottom - rc.top;
     if (g_imgW == 0 || g_imgH == 0) { g_zoom = 1.0; return; }
@@ -494,9 +589,9 @@ static void FitToWindow(HWND hWnd) {
     g_zoom = (zx < zy) ? zx : zy;
     if (g_zoom > 16.0) g_zoom = 16.0;
     if (g_zoom < 0.01) g_zoom = 0.01;
-    // Center
-    g_offsetX = (cw - (int)(g_imgW * g_zoom)) / 2;
-    g_offsetY = (ch - (int)(g_imgH * g_zoom)) / 2;
+    // Center within the image area
+    g_offsetX = rc.left + (cw - (int)(g_imgW * g_zoom)) / 2;
+    g_offsetY = rc.top + (ch - (int)(g_imgH * g_zoom)) / 2;
 }
 
 static void UpdateLayout(HWND hWnd) {
@@ -509,6 +604,7 @@ static void UpdateLayout(HWND hWnd) {
         SendMessageW(g_hStatusBar, WM_SIZE, 0, 0);
     }
     LayoutControls(hWnd);
+    LayoutSvgPane(hWnd);
 }
 
 // ---------------------------------------------------------------------------
@@ -856,8 +952,8 @@ static void ZoomAt(HWND hWnd, int cx, int cy, double factor) {
 
 static void ZoomCenter(HWND hWnd, double factor) {
     RECT rc;
-    GetClientRect(hWnd, &rc);
-    ZoomAt(hWnd, (rc.right - rc.left) / 2, (rc.bottom - rc.top) / 2, factor);
+    GetImageArea(hWnd, &rc);
+    ZoomAt(hWnd, (rc.left + rc.right) / 2, (rc.top + rc.bottom) / 2, factor);
 }
 
 // ---------------------------------------------------------------------------
@@ -990,6 +1086,18 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int nCmdShow) {
     g_hBtnRate = CreateWindowExW(0, L"BUTTON", L"1x",
         bstyle, 0, 0, 0, 0, g_hWnd, (HMENU)IDC_BTN_RATE, hInstance, nullptr);
 
+    // SVG source edit pane (hidden until an SVG is opened)
+    g_hSvgEdit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", nullptr,
+        WS_CHILD | WS_VISIBLE | WS_VSCROLL | WS_HSCROLL | ES_MULTILINE | ES_AUTOVSCROLL | ES_AUTOHSCROLL | WS_TABSTOP,
+        0, 0, 0, 0, g_hWnd, (HMENU)IDC_SVG_EDIT, hInstance, nullptr);
+    if (g_hSvgEdit) {
+        HFONT hMono = CreateFontW(16, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+            DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+            DEFAULT_QUALITY, FIXED_PITCH, L"Consolas");
+        SendMessageW(g_hSvgEdit, WM_SETFONT, (WPARAM)hMono, TRUE);
+        ShowWindow(g_hSvgEdit, SW_HIDE);
+    }
+
     CenterWindow(g_hWnd);
     ShowWindow(g_hWnd, nCmdShow);
     UpdateWindow(g_hWnd);
@@ -1002,12 +1110,19 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int nCmdShow) {
     }
     if (argv) LocalFree(argv);
 
+    // Accelerator: Ctrl+S saves the SVG source (works while the edit pane has focus)
+    ACCEL accel = { FCONTROL | FVIRTKEY, 'S', IDM_SAVE };
+    HACCEL hAccel = CreateAcceleratorTableW(&accel, 1);
+
     // Message loop
     MSG msg;
     while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
-        TranslateMessage(&msg);
-        DispatchMessageW(&msg);
+        if (!TranslateAcceleratorW(g_hWnd, hAccel, &msg)) {
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
     }
+    DestroyAcceleratorTable(hAccel);
 
     ShutdownWIC();
     return (int)msg.wParam;
@@ -1037,6 +1152,9 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         switch (wParam) {
         case 'O':
             if (ctrl) OpenFile(hWnd);
+            break;
+        case 'S':
+            if (ctrl) SaveSvg(hWnd);
             break;
         case VK_ADD:
         case '=':
@@ -1163,6 +1281,9 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 swprintf_s(buf, L"#%02X%02X%02X", g_ctxColor[2], g_ctxColor[1], g_ctxColor[0]);
                 CopyTextToClipboard(hWnd, buf);
             }
+            return 0;
+        case IDM_SAVE:
+            SaveSvg(hWnd);
             return 0;
         }
         break;
