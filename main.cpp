@@ -26,6 +26,8 @@
 #define IDC_BTN_PLAY 1002
 #define IDC_BTN_NEXT 1003
 #define IDC_BTN_RATE 1004
+#define IDM_COPY_RGB 2001
+#define IDM_COPY_HEX 2002
 #define IDT_ANIM     2
 
 #pragma comment(lib, "windowscodecs.lib")
@@ -83,6 +85,10 @@ static HWND        g_hBtnPlay = nullptr;
 static HWND        g_hBtnNext = nullptr;
 static HWND        g_hBtnRate = nullptr;
 
+// Context menu pixel
+static BYTE        g_ctxColor[4] = { 0, 0, 0, 255 };
+static bool        g_ctxValid    = false;
+
 // ---------------------------------------------------------------------------
 // Forward declarations
 // ---------------------------------------------------------------------------
@@ -103,6 +109,8 @@ static void      StopPlayback(HWND hWnd);
 static void      GotoFrame(HWND hWnd, int delta);
 static void      CycleRate(HWND hWnd);
 static void      LayoutControls(HWND hWnd);
+static bool      CopyTextToClipboard(HWND hWnd, const wchar_t* text);
+static void      ShowContextMenu(HWND hWnd, int cx, int cy);
 
 // ---------------------------------------------------------------------------
 // WIC helpers
@@ -504,6 +512,44 @@ static void SetCursorStatus(int cx, int cy) {
 }
 
 // ---------------------------------------------------------------------------
+// Context menu (copy color)
+// ---------------------------------------------------------------------------
+
+static bool CopyTextToClipboard(HWND hWnd, const wchar_t* text) {
+    if (!OpenClipboard(hWnd)) return false;
+    EmptyClipboard();
+    bool ok = false;
+    size_t bytes = (wcslen(text) + 1) * sizeof(wchar_t);
+    HGLOBAL hMem = GlobalAlloc(GMEM_MOVEABLE, bytes);
+    if (hMem) {
+        void* p = GlobalLock(hMem);
+        if (p) {
+            memcpy(p, text, bytes);
+            GlobalUnlock(hMem);
+            ok = SetClipboardData(CF_UNICODETEXT, hMem) != nullptr;
+        }
+    }
+    CloseClipboard();
+    return ok;
+}
+
+static void ShowContextMenu(HWND hWnd, int cx, int cy) {
+    BYTE px[4];
+    if (!GetPixelAt(cx, cy, px)) return;
+    memcpy(g_ctxColor, px, 4);
+    g_ctxValid = true;
+
+    HMENU hMenu = CreatePopupMenu();
+    AppendMenuW(hMenu, MF_STRING, IDM_COPY_RGB, L"拷贝 RGB 颜色");
+    AppendMenuW(hMenu, MF_STRING, IDM_COPY_HEX, L"拷贝十六进制颜色");
+
+    POINT pt = { cx, cy };
+    ClientToScreen(hWnd, &pt);
+    TrackPopupMenu(hMenu, TPM_RIGHTBUTTON, pt.x, pt.y, 0, hWnd, nullptr);
+    DestroyMenu(hMenu);
+}
+
+// ---------------------------------------------------------------------------
 // Zoom at cursor
 // ---------------------------------------------------------------------------
 
@@ -806,6 +852,13 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         ToggleFullscreen(hWnd);
         return 0;
 
+    case WM_RBUTTONUP: {
+        int mx = GET_X_LPARAM(lParam);
+        int my = GET_Y_LPARAM(lParam);
+        ShowContextMenu(hWnd, mx, my);
+        return 0;
+    }
+
     case WM_DROPFILES:
         HandleDrop((HDROP)wParam);
         return 0;
@@ -822,6 +875,20 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             else StartPlayback(hWnd);
             return 0;
         case IDC_BTN_RATE: CycleRate(hWnd); return 0;
+        case IDM_COPY_RGB:
+            if (g_ctxValid) {
+                wchar_t buf[32];
+                swprintf_s(buf, L"%d, %d, %d", g_ctxColor[2], g_ctxColor[1], g_ctxColor[0]);
+                CopyTextToClipboard(hWnd, buf);
+            }
+            return 0;
+        case IDM_COPY_HEX:
+            if (g_ctxValid) {
+                wchar_t buf[32];
+                swprintf_s(buf, L"#%02X%02X%02X", g_ctxColor[2], g_ctxColor[1], g_ctxColor[0]);
+                CopyTextToClipboard(hWnd, buf);
+            }
+            return 0;
         }
         break;
 
