@@ -109,10 +109,14 @@ static HWND        g_hBtnRotR = nullptr;
 static BYTE*       g_rotBuf = nullptr;
 static int         g_rot = 0;             // 0..3 quarter turns
 
-// HIG (single-channel grayscale) state
-static bool                g_isHig   = false;
-static int                 g_higBits = 0;
-static std::vector<DWORD>  g_higData;   // raw per-pixel value (for status display)
+// HIG (custom single-channel grayscale)
+static bool                g_isHig = false;
+static std::vector<BYTE>   g_higHeader;  // original 1048-byte header (for saving)
+
+// Real per-pixel gray value (grayscale images: HIG, gray TIFF, etc.)
+static bool                g_hasRealGray = false;
+static int                 g_realBits = 0;
+static std::vector<DWORD>  g_realGray;   // raw sample value (for status display)
 
 // SVG state
 static resvg_render_tree* g_svgTree = nullptr;
@@ -170,6 +174,7 @@ static void      BrowseImage(HWND hWnd, int delta);
 static bool      LoadIcoPng(const wchar_t* path);
 static bool      LoadSvgFile(const wchar_t* path);
 static bool      LoadHigFile(const wchar_t* path);
+static void      CaptureRealGray();
 static void      GetImageArea(HWND hWnd, RECT* rc);
 static void      LayoutSvgPane(HWND hWnd);
 static void      MaterializeStaticSource();
@@ -334,9 +339,10 @@ static bool LoadIcoPng(const wchar_t* path) {
 //   884 nCount, 888 nBitsDisp, 892 nByteGraph, 896 dDPM, 904 dGamma,
 //   912 nGrayStart, 916 nGrayWidth, 920 nDataLen, 924 Reserved[31] -> 1048
 
-static BYTE HigGray(DWORD v, int width) {
+static BYTE HigGray(DWORD v, int center, int width) {
     if (width <= 0) width = 1;
-    double t = ((double)(int)v) * 255.0 / width;
+    double lo = center - width / 2.0;
+    double t = ((double)(int)v - lo) * 255.0 / width;
     if (t < 0) t = 0; if (t > 255) t = 255;
     return (BYTE)(t + 0.5);
 }
@@ -361,7 +367,7 @@ static bool LoadHigFile(const wchar_t* path) {
     int nGrayStart = rdi32(912);
     int nGrayWidth = rdi32(916);
 
-    if (nType != 0x476948) return false; // 'HiG'
+    if (nType != 0x484947 && nType != 0x476948) return false; // 'GIH' or 'HiG'
     if (nWidth <= 0 || nHeight <= 0 || nBits <= 0) return false;
 
     int bpp = (nBits <= 8) ? 1 : 2; // 10/12/16-bit stored as 16-bit words
@@ -374,10 +380,16 @@ static bool LoadHigFile(const wchar_t* path) {
         raw[i] = (bpp == 1) ? img[i] : ((WORD)img[i * 2] | ((WORD)img[i * 2 + 1] << 8));
     }
 
-    // Display via window/level to 8-bit gray (opaque BGRA)
+    // Window/level: auto-window over the full bit range when the header gives 0.
+    int maxVal = (1 << nBits) - 1;
+    int center = nGrayStart;
+    int width  = nGrayWidth;
+    if (width <= 0) { width = maxVal; if (center == 0) center = maxVal / 2; }
+
+    // Display to 8-bit gray (opaque BGRA)
     BYTE* buf = new BYTE[nPix * 4];
     for (size_t i = 0; i < nPix; i++) {
-        BYTE g = HigGray(raw[i], nGrayWidth);
+        BYTE g = HigGray(raw[i], center, width);
         buf[i * 4 + 0] = g;
         buf[i * 4 + 1] = g;
         buf[i * 4 + 2] = g;
@@ -386,8 +398,10 @@ static bool LoadHigFile(const wchar_t* path) {
 
     CloseImage();
     g_isHig = true;
-    g_higBits = nBits;
-    g_higData = std::move(raw);
+    g_higHeader.assign(data.begin(), data.begin() + 1048);
+    g_realBits = nBits;
+    g_realGray = std::move(raw);
+    g_hasRealGray = true;
     g_pComposite = buf;
     g_imgW = (UINT)nWidth;
     g_imgH = (UINT)nHeight;
@@ -558,8 +572,10 @@ static void CloseImage() {
     g_isSvg = false;
     g_isGif = false;
     g_isHig = false;
-    g_higBits = 0;
-    g_higData.clear();
+    g_higHeader.clear();
+    g_hasRealGray = false;
+    g_realBits = 0;
+    g_realGray.clear();
     g_playing = false;
     g_frameCount = 1;
     g_frameIndex = 0;
@@ -740,7 +756,7 @@ static void UpdateLayout(HWND hWnd) {
         int sbw = sbrc.right - sbrc.left;
         int sbh = sbrc.bottom - sbrc.top;
         const int fitW = 24, txtW = 24, gap = 2, grip = 18;
-        bool showRot = (g_rotBuf != nullptr); // static (non-animated) image
+        bool showRot = (g_rotBuf != nullptr); // any static (non-animated) image
         int nRight = fitW + (showRot ? 2 * (txtW + gap) : 0) + 12;
         int reserved = nRight + grip;
         int p0 = 320;
@@ -1068,10 +1084,10 @@ static void SetCursorStatus(int cx, int cy) {
     int ix = (int)((cx - g_offsetX) / g_zoom);
     int iy = (int)((cy - g_offsetY) / g_zoom);
     wchar_t buf[160];
-    if (g_isHig && ix >= 0 && iy >= 0 && ix < (int)g_imgW && iy < (int)g_imgH) {
-        DWORD v = g_higData[(size_t)iy * g_imgW + ix];
+    if (g_hasRealGray && ix >= 0 && iy >= 0 && ix < (int)g_imgW && iy < (int)g_imgH) {
+        DWORD v = g_realGray[(size_t)iy * g_imgW + ix];
         swprintf_s(buf, L"(%d, %d)  R: %d G: %d B: %d  |  %u-bit 灰度: %u",
-                   ix, iy, px[2], px[1], px[0], g_higBits, v);
+                   ix, iy, px[2], px[1], px[0], g_realBits, v);
     } else {
         swprintf_s(buf, L"(%d, %d)  R: %d G: %d B: %d A: %d",
                    ix, iy, px[2], px[1], px[0], px[3]);
@@ -1156,6 +1172,7 @@ static void BuildFileList(const wchar_t* path) {
 
 static bool OpenImagePath(const wchar_t* path) {
     if (!LoadImageFile(path)) return false;
+    CaptureRealGray();
     MaterializeStaticSource();
     BuildFileList(path);
     UpdateLayout(g_hWnd);
@@ -1169,6 +1186,7 @@ static void BrowseImage(HWND hWnd, int delta) {
     int idx = g_fileIndex + delta;
     if (idx < 0 || idx >= (int)g_fileList.size()) return;
     if (!LoadImageFile(g_fileList[idx].c_str())) return;
+    CaptureRealGray();
     MaterializeStaticSource();
     g_fileIndex = idx;
     UpdateLayout(hWnd);
@@ -1380,10 +1398,36 @@ static void DoBestFit(HWND hWnd) {
 // Non-SVG rotation / save
 // ---------------------------------------------------------------------------
 
+// Capture the real per-pixel gray value for grayscale (e.g. 16-bit TIFF)
+// decoded by WIC, so the status bar can show the true sample value.
+static void CaptureRealGray() {
+    g_hasRealGray = false;
+    g_realGray.clear();
+    g_realBits = 0;
+    if (g_isHig || !g_pFrame || g_imgW == 0 || g_imgH == 0) return;
+    WICPixelFormatGUID pf;
+    if (FAILED(g_pFrame->GetPixelFormat(&pf))) return;
+    int bits = 0;
+    if (pf == GUID_WICPixelFormat8bppGray) bits = 8;
+    else if (pf == GUID_WICPixelFormat16bppGray) bits = 16;
+    if (bits == 0) return;
+    size_t n = (size_t)g_imgW * g_imgH;
+    g_realGray.resize(n);
+    if (bits == 8) {
+        if (FAILED(g_pFrame->CopyPixels(nullptr, g_imgW, (UINT)n, (BYTE*)g_realGray.data()))) { g_realGray.clear(); return; }
+    } else {
+        std::vector<BYTE> tmp(n * 2);
+        if (FAILED(g_pFrame->CopyPixels(nullptr, g_imgW * 2, (UINT)(n * 2), tmp.data()))) { g_realGray.clear(); return; }
+        for (size_t i = 0; i < n; i++) g_realGray[i] = tmp[i * 2] | ((DWORD)tmp[i * 2 + 1] << 8);
+    }
+    g_realBits = bits;
+    g_hasRealGray = true;
+}
+
 // Materialize the static (non-animated, non-SVG) source into a persistent
 // BGRA buffer so we can rotate it in place.
 static void MaterializeStaticSource() {
-    if (g_isSvg || g_isGif || g_isHig) return;
+    if (g_isSvg || g_isGif) return;
     delete[] g_rotBuf; g_rotBuf = nullptr;
     g_rot = 0;
     if ((!g_pConverter && !g_pComposite) || g_imgW == 0 || g_imgH == 0) return;
@@ -1395,24 +1439,27 @@ static void MaterializeStaticSource() {
 
 static void RotateImage(HWND hWnd, bool clockwise) {
     SetFocus(hWnd);
-    if (g_isSvg || g_isGif || g_isHig) return; // only static images
+    if (g_isSvg || g_isGif) return;
     if (!g_rotBuf || g_imgW == 0 || g_imgH == 0) return;
     UINT W = g_imgW, H = g_imgH;
+    bool hasGray = g_hasRealGray && g_realGray.size() == (size_t)W * H;
     std::vector<BYTE> out((size_t)W * H * 4);
+    std::vector<DWORD> outGray;
+    if (hasGray) outGray.resize((size_t)W * H);
     for (UINT y = 0; y < H; y++) {
         for (UINT x = 0; x < W; x++) {
             const BYTE* s = g_rotBuf + ((size_t)y * W + x) * 4;
-            BYTE* d;
-            if (clockwise)
-                d = out.data() + ((size_t)x * H + (H - 1 - y)) * 4;
-            else
-                d = out.data() + ((size_t)(W - 1 - x) * H + y) * 4;
-            memcpy(d, s, 4);
+            size_t di;
+            if (clockwise) di = (size_t)x * H + (H - 1 - y);
+            else           di = (size_t)(W - 1 - x) * H + y;
+            memcpy(out.data() + di * 4, s, 4);
+            if (hasGray) outGray[di] = g_realGray[(size_t)y * W + x];
         }
     }
     delete[] g_rotBuf;
     g_rotBuf = new BYTE[(size_t)H * W * 4];
     memcpy(g_rotBuf, out.data(), (size_t)H * W * 4);
+    if (hasGray) g_realGray = std::move(outGray);
     g_imgW = H; g_imgH = W;
     g_rot = (g_rot + (clockwise ? 1 : 3)) & 3;
     g_fitWindow = true;
@@ -1424,6 +1471,77 @@ static void RotateImage(HWND hWnd, bool clockwise) {
 static bool SaveImageFile(const wchar_t* path) {
     if ((!g_rotBuf && !g_pConverter && !g_pComposite) || g_imgW == 0 || g_imgH == 0) return false;
     UINT W = g_imgW, H = g_imgH;
+
+    // Container from extension
+    GUID container = GUID_ContainerFormatPng;
+    std::wstring p = path;
+    size_t dot = p.find_last_of(L'.');
+    std::wstring ext = (dot != std::wstring::npos) ? p.substr(dot + 1) : std::wstring();
+    for (auto& c : ext) c = towlower(c);
+    if (ext == L"jpg" || ext == L"jpeg") container = GUID_ContainerFormatJpeg;
+    else if (ext == L"bmp") container = GUID_ContainerFormatBmp;
+    else if (ext == L"tif" || ext == L"tiff") container = GUID_ContainerFormatTiff;
+
+    // HIG: write the custom format, preserving the original header and bit depth.
+    if (g_isHig && !g_higHeader.empty() && g_realGray.size() == (size_t)W * H) {
+        std::vector<BYTE> hdr = g_higHeader;
+        auto putI32 = [&](size_t o, int v) { memcpy(&hdr[o], &v, 4); };
+        putI32(4, (int)W);
+        putI32(8, (int)H);
+        putI32(12, g_realBits);
+        std::vector<BYTE> payload;
+        if (g_realBits <= 8) {
+            payload.resize((size_t)W * H);
+            for (size_t i = 0; i < (size_t)W * H; i++) payload[i] = (BYTE)g_realGray[i];
+        } else {
+            payload.resize((size_t)W * H * 2);
+            for (size_t i = 0; i < (size_t)W * H; i++) {
+                payload[i * 2 + 0] = (BYTE)(g_realGray[i] & 0xff);
+                payload[i * 2 + 1] = (BYTE)((g_realGray[i] >> 8) & 0xff);
+            }
+        }
+        putI32(920, (int)payload.size()); // nDataLen
+        HANDLE h = CreateFileW(path, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, 0, nullptr);
+        if (h == INVALID_HANDLE_VALUE) return false;
+        DWORD wr = 0;
+        BOOL ok = WriteFile(h, hdr.data(), 1048, &wr, nullptr);
+        if (ok && !payload.empty()) ok = WriteFile(h, payload.data(), (DWORD)payload.size(), &wr, nullptr);
+        CloseHandle(h);
+        return ok != FALSE;
+    }
+
+    // 16-bit grayscale (e.g. TIFF/PNG): preserve bit depth where the container
+    // supports it (PNG, TIFF); fall back to 8-bit for BMP/JPEG.
+    bool want16 = g_hasRealGray && g_realBits > 8 && g_realGray.size() == (size_t)W * H &&
+                  (container == GUID_ContainerFormatPng || container == GUID_ContainerFormatTiff);
+    if (want16) {
+        std::vector<BYTE> g16((size_t)W * H * 2);
+        for (size_t i = 0; i < (size_t)W * H; i++) {
+            g16[i * 2 + 0] = (BYTE)(g_realGray[i] & 0xff);
+            g16[i * 2 + 1] = (BYTE)((g_realGray[i] >> 8) & 0xff);
+        }
+        IWICStream* stream = nullptr;
+        if (FAILED(g_pWICFactory->CreateStream(&stream))) return false;
+        if (FAILED(stream->InitializeFromFilename(path, GENERIC_WRITE))) { stream->Release(); return false; }
+        IWICBitmapEncoder* enc = nullptr;
+        if (FAILED(g_pWICFactory->CreateEncoder(container, nullptr, &enc))) { stream->Release(); return false; }
+        if (FAILED(enc->Initialize(stream, WICBitmapEncoderNoCache))) { enc->Release(); stream->Release(); return false; }
+        IWICBitmapFrameEncode* fr = nullptr;
+        IPropertyBag2* bag = nullptr;
+        if (FAILED(enc->CreateNewFrame(&fr, &bag))) { enc->Release(); stream->Release(); return false; }
+        fr->Initialize(bag);
+        fr->SetSize(W, H);
+        WICPixelFormatGUID pf = GUID_WICPixelFormat16bppGray;
+        fr->SetPixelFormat(&pf);
+        HRESULT hr = (pf == GUID_WICPixelFormat16bppGray)
+            ? fr->WritePixels(H, W * 2, W * H * 2, g16.data()) : E_FAIL;
+        if (bag) bag->Release();
+        fr->Commit();
+        enc->Commit();
+        fr->Release(); enc->Release(); stream->Release();
+        if (SUCCEEDED(hr)) return true;
+        // fall through to 8-bit path if the encoder rejected 16-bit gray
+    }
 
     // Gather the (possibly rotated) current pixels as straight BGRA.
     std::vector<BYTE> tmp((size_t)W * H * 4);
@@ -1453,14 +1571,6 @@ static bool SaveImageFile(const wchar_t* path) {
             tmp[i * 4 + 3] = a;
         }
     }
-
-    GUID container = GUID_ContainerFormatPng;
-    std::wstring p = path;
-    size_t dot = p.find_last_of(L'.');
-    std::wstring ext = (dot != std::wstring::npos) ? p.substr(dot + 1) : std::wstring();
-    for (auto& c : ext) c = towlower(c);
-    if (ext == L"jpg" || ext == L"jpeg") container = GUID_ContainerFormatJpeg;
-    else if (ext == L"bmp") container = GUID_ContainerFormatBmp;
 
     IWICStream* stream = nullptr;
     if (FAILED(g_pWICFactory->CreateStream(&stream))) return false;
