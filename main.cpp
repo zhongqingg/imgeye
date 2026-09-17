@@ -38,7 +38,6 @@ extern const Lexilla::LexerModule lmXML;
 #define IDC_BTN_FIT  1006
 #define IDC_BTN_ROTL 1007
 #define IDC_BTN_ROTR 1008
-#define IDC_BTN_SAVE 1009
 #define IDM_COPY_RGB 2001
 #define IDM_COPY_HEX 2002
 #define IDM_SAVE     2003
@@ -103,9 +102,8 @@ static HWND        g_hBtnNext = nullptr;
 static HWND        g_hBtnRate = nullptr;
 static HWND        g_hBtnFit = nullptr;   // "best fit" button (overlay on status bar)
 static HBITMAP     g_hBtnFitBmp = nullptr;
-static HWND        g_hBtnRotL = nullptr;  // rotate left / right / save
+static HWND        g_hBtnRotL = nullptr;  // rotate left / right
 static HWND        g_hBtnRotR = nullptr;
-static HWND        g_hBtnSave = nullptr;
 
 // Non-SVG rotation state (materialized BGRA buffer, rotated in place)
 static BYTE*       g_rotBuf = nullptr;
@@ -171,7 +169,7 @@ static void      LayoutSvgPane(HWND hWnd);
 static void      MaterializeStaticSource();
 static void      RotateImage(HWND hWnd, bool clockwise);
 static bool      SaveImageFile(const wchar_t* path);
-static void      SaveImageDialog(HWND hWnd);
+static void      SaveCurrentImage(HWND hWnd);
 static void      LoadSvgIntoEdit(const wchar_t* path);
 static void      SaveSvg(HWND hWnd);
 
@@ -657,9 +655,9 @@ static void UpdateLayout(HWND hWnd) {
         RECT sbrc; GetClientRect(g_hStatusBar, &sbrc);
         int sbw = sbrc.right - sbrc.left;
         int sbh = sbrc.bottom - sbrc.top;
-        const int fitW = 24, txtW = 38, gap = 2, grip = 18;
+        const int fitW = 24, txtW = 24, gap = 2, grip = 18;
         bool showRot = (g_rotBuf != nullptr); // static (non-animated) image
-        int nRight = fitW + (showRot ? 3 * txtW : 0) + (showRot ? 3 * gap : 0) + 12;
+        int nRight = fitW + (showRot ? 2 * (txtW + gap) : 0) + 12;
         int reserved = nRight + grip;
         int p0 = 320;
         int p1 = sbw - reserved;
@@ -671,7 +669,6 @@ static void UpdateLayout(HWND hWnd) {
         int x = sbw - grip - fitW;
         if (g_hBtnFit) MoveWindow(g_hBtnFit, x, 2, fitW, sbh - 4, TRUE);
         int show = showRot ? SW_SHOW : SW_HIDE;
-        if (g_hBtnSave) { ShowWindow(g_hBtnSave, show); if (showRot) { x -= txtW + gap; MoveWindow(g_hBtnSave, x, 2, txtW, sbh - 4, TRUE); } }
         if (g_hBtnRotR) { ShowWindow(g_hBtnRotR, show); if (showRot) { x -= txtW + gap; MoveWindow(g_hBtnRotR, x, 2, txtW, sbh - 4, TRUE); } }
         if (g_hBtnRotL) { ShowWindow(g_hBtnRotL, show); if (showRot) { x -= txtW + gap; MoveWindow(g_hBtnRotL, x, 2, txtW, sbh - 4, TRUE); } }
     }
@@ -794,7 +791,7 @@ static void Paint(HWND hWnd) {
                 DeleteObject(hbmImg);
             }
         }
-    } else if ((g_pConverter || g_pComposite) && g_imgW > 0 && g_imgH > 0) {
+    } else if ((g_rotBuf || g_pConverter || g_pComposite) && g_imgW > 0 && g_imgH > 0) {
         // Build the source pixels (image resolution, premultiplied BGRA);
         // prefer the rotated buffer when present.
         UINT cbStride = g_imgW * 4;
@@ -962,7 +959,7 @@ static bool GetPixelAt(int cx, int cy, BYTE out[4]) {
         memcpy(out, g_svgRaw + ((size_t)by * g_svgViewW + bx) * 4, 4);
         return true;
     }
-    if (!g_pConverter && !g_pComposite) return false;
+    if (!g_rotBuf && !g_pConverter && !g_pComposite) return false;
     int ix = (int)((cx - g_offsetX) / g_zoom);
     int iy = (int)((cy - g_offsetY) / g_zoom);
     if (ix < 0 || iy < 0 || ix >= (int)g_imgW || iy >= (int)g_imgH) return false;
@@ -1184,6 +1181,62 @@ static LRESULT CALLBACK StatusBarSubclass(HWND hwnd, UINT msg, WPARAM wParam, LP
     return DefSubclassProc(hwnd, msg, wParam, lParam);
 }
 
+// Draw a circular arrow (rotate icon): arc + arrowhead along the direction of travel.
+static void DrawRotateArrow(HDC hdc, int cx, int cy, int r, double a0, double sweep) {
+    const int steps = 16;
+    POINT pts[32];
+    for (int i = 0; i <= steps; i++) {
+        double a = a0 + sweep * i / steps;
+        pts[i].x = (int)(cx + r * cos(a) + 0.5);
+        pts[i].y = (int)(cy + r * sin(a) + 0.5);
+    }
+    Polyline(hdc, pts, steps + 1);
+    double dir = (sweep >= 0) ? 1 : -1;
+    double a1 = a0 + sweep;
+    double ex = cx + r * cos(a1), ey = cy + r * sin(a1);
+    double tang = a1 + dir * 1.5707963;
+    double perp = tang + 1.5707963;
+    int hlen = 4, w = 3;
+    POINT tip   = { (int)(ex + hlen * cos(tang) + 0.5), (int)(ey + hlen * sin(tang) + 0.5) };
+    POINT base1 = { (int)(ex + w * cos(perp) + 0.5),     (int)(ey + w * sin(perp) + 0.5) };
+    POINT base2 = { (int)(ex - w * cos(perp) + 0.5),     (int)(ey - w * sin(perp) + 0.5) };
+    POINT tri[3] = { tip, base1, base2 };
+    Polygon(hdc, tri, 3);
+}
+
+static HBITMAP MakeRotateIcon(bool clockwise) {
+    const int s = 16;
+    COLORREF face = GetSysColor(COLOR_BTNFACE);
+    HDC hdc = GetDC(nullptr);
+    HDC hdcMem = CreateCompatibleDC(hdc);
+    HBITMAP bmp = CreateCompatibleBitmap(hdc, s, s);
+    if (!bmp) { DeleteDC(hdcMem); ReleaseDC(nullptr, hdc); return nullptr; }
+    HBITMAP old = (HBITMAP)SelectObject(hdcMem, bmp);
+    HBRUSH bg = CreateSolidBrush(face);
+    RECT rc = { 0, 0, s, s };
+    FillRect(hdcMem, &rc, bg);
+    DeleteObject(bg);
+    COLORREF fg = RGB(60, 60, 60);
+    HPEN pen = CreatePen(PS_SOLID, 1, fg);
+    HPEN oldPen = (HPEN)SelectObject(hdcMem, pen);
+    HBRUSH fgBrush = CreateSolidBrush(fg);
+    HBRUSH oldBrush = (HBRUSH)SelectObject(hdcMem, fgBrush);
+    // Both arrows start at the bottom (90 deg) and are mirror images across the
+// vertical axis: left sweeps counter-clockwise, right sweeps clockwise.
+    if (clockwise)
+        DrawRotateArrow(hdcMem, 8, 8, 5, 1.5707963, 1.5 * 3.14159265);
+    else
+        DrawRotateArrow(hdcMem, 8, 8, 5, 1.5707963, -1.5 * 3.14159265);
+    SelectObject(hdcMem, oldPen);
+    SelectObject(hdcMem, oldBrush);
+    DeleteObject(pen);
+    DeleteObject(fgBrush);
+    SelectObject(hdcMem, old);
+    DeleteDC(hdcMem);
+    ReleaseDC(nullptr, hdc);
+    return bmp;
+}
+
 static HBITMAP MakeFitIcon() {
     const int s = 16;
     COLORREF face = GetSysColor(COLOR_BTNFACE);
@@ -1261,9 +1314,9 @@ static void RotateImage(HWND hWnd, bool clockwise) {
             const BYTE* s = g_rotBuf + ((size_t)y * W + x) * 4;
             BYTE* d;
             if (clockwise)
-                d = out.data() + ((size_t)(W - 1 - x) * H + y) * 4;
-            else
                 d = out.data() + ((size_t)x * H + (H - 1 - y)) * 4;
+            else
+                d = out.data() + ((size_t)(W - 1 - x) * H + y) * 4;
             memcpy(d, s, 4);
         }
     }
@@ -1340,23 +1393,21 @@ static bool SaveImageFile(const wchar_t* path) {
     return SUCCEEDED(hr);
 }
 
-static void SaveImageDialog(HWND hWnd) {
+// Release the WIC file-backed decoder chain (frees the source file lock) while
+// keeping the materialized rotated buffer for display/picking.
+static void ReleaseWicSource() {
+    if (g_pConverter) { g_pConverter->Release(); g_pConverter = nullptr; }
+    if (g_pFrame)    { g_pFrame->Release();      g_pFrame = nullptr; }
+    if (g_pDecoder)  { g_pDecoder->Release();     g_pDecoder = nullptr; }
+}
+
+static void SaveCurrentImage(HWND hWnd) {
     if ((!g_rotBuf && !g_pConverter && !g_pComposite) || g_imgW == 0) return;
-    wchar_t file[MAX_PATH] = {};
-    wcscpy_s(file, g_currentFile.c_str());
-    OPENFILENAMEW ofn = {};
-    ofn.lStructSize  = sizeof(ofn);
-    ofn.hwndOwner    = hWnd;
-    ofn.lpstrFilter  = L"PNG 图像\0*.png\0JPEG 图像\0*.jpg;*.jpeg\0BMP 图像\0*.bmp\0所有文件\0*.*\0";
-    ofn.lpstrFile    = file;
-    ofn.nMaxFile     = MAX_PATH;
-    ofn.Flags        = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST;
-    ofn.lpstrDefExt  = L"png";
-    ofn.lpstrTitle   = L"保存图像";
-    if (GetSaveFileNameW(&ofn)) {
-        if (!SaveImageFile(file))
-            MessageBoxW(hWnd, L"保存失败。", L"Error", MB_OK | MB_ICONERROR);
-    }
+    if (g_currentFile.empty()) return;
+    // Overwriting the same file needs the decoder's handle released first.
+    if (g_rotBuf && !g_isGif) ReleaseWicSource();
+    if (!SaveImageFile(g_currentFile.c_str()))
+        MessageBoxW(hWnd, L"保存失败。", L"Error", MB_OK | MB_ICONERROR);
 }
 
 // ---------------------------------------------------------------------------
@@ -1456,14 +1507,20 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int nCmdShow) {
         }
     }
 
-    // Rotate / save buttons (child of the status bar, shown for static images)
-    DWORD tb = WS_CHILD | WS_VISIBLE | BS_FLAT | BS_PUSHBUTTON;
-    g_hBtnRotL = CreateWindowExW(0, L"BUTTON", L"左转",
+    // Rotate buttons (child of the status bar, shown for static images)
+    DWORD tb = WS_CHILD | WS_VISIBLE | BS_BITMAP | BS_FLAT | BS_PUSHBUTTON;
+    g_hBtnRotL = CreateWindowExW(0, L"BUTTON", L"",
         tb, 0, 0, 0, 0, g_hStatusBar, (HMENU)IDC_BTN_ROTL, hInstance, nullptr);
-    g_hBtnRotR = CreateWindowExW(0, L"BUTTON", L"右转",
+    g_hBtnRotR = CreateWindowExW(0, L"BUTTON", L"",
         tb, 0, 0, 0, 0, g_hStatusBar, (HMENU)IDC_BTN_ROTR, hInstance, nullptr);
-    g_hBtnSave = CreateWindowExW(0, L"BUTTON", L"保存",
-        tb, 0, 0, 0, 0, g_hStatusBar, (HMENU)IDC_BTN_SAVE, hInstance, nullptr);
+    if (g_hBtnRotL) {
+        HBITMAP b = MakeRotateIcon(false);
+        if (b) SendMessageW(g_hBtnRotL, BM_SETIMAGE, IMAGE_BITMAP, (LPARAM)b);
+    }
+    if (g_hBtnRotR) {
+        HBITMAP b = MakeRotateIcon(true);
+        if (b) SendMessageW(g_hBtnRotR, BM_SETIMAGE, IMAGE_BITMAP, (LPARAM)b);
+    }
 
     // GIF control bar (hidden until a GIF is loaded)
     DWORD bstyle = WS_CHILD | BS_FLAT | BS_PUSHBUTTON;
@@ -1563,7 +1620,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         case 'S':
             if (ctrl) {
                 if (g_isSvg) SaveSvg(hWnd);
-                else SaveImageDialog(hWnd);
+                else SaveCurrentImage(hWnd);
             }
             break;
         case VK_ADD:
@@ -1677,7 +1734,6 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         case IDC_BTN_FIT: DoBestFit(hWnd); return 0;
         case IDC_BTN_ROTL: RotateImage(hWnd, false); return 0;
         case IDC_BTN_ROTR: RotateImage(hWnd, true); return 0;
-        case IDC_BTN_SAVE: SaveImageDialog(hWnd); return 0;
         case IDM_COPY_RGB:
             if (g_ctxValid) {
                 wchar_t buf[32];
@@ -1694,7 +1750,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             return 0;
         case IDM_SAVE:
             if (g_isSvg) SaveSvg(hWnd);
-            else SaveImageDialog(hWnd);
+            else SaveCurrentImage(hWnd);
             return 0;
         }
         break;
