@@ -110,6 +110,8 @@ static int                g_svgViewW = 0;
 static int                g_svgViewH = 0;
 static int                g_svgViewOffX = 0;
 static int                g_svgViewOffY = 0;
+static int                g_svgViewVX = 0; // view-space origin of the rendered buffer
+static int                g_svgViewVY = 0;
 static HWND               g_hSvgEdit = nullptr; // editable SVG source pane
 
 // Context menu pixel
@@ -360,6 +362,28 @@ static void GetImageArea(HWND hWnd, RECT* rc) {
     }
 }
 
+// Compute the visible sub-region (in view coordinates) of a dw x dh image
+// clipped to the on-screen image area, plus a margin so the pattern edges
+// don't flicker on small pan/zoom movements.
+static bool ComputeVisibleRect(int dw, int dh, int* vl, int* vt, int* vr, int* vb) {
+    RECT area;
+    GetImageArea(g_hWnd, &area);
+    const int margin = 16;
+    int l = area.left - g_offsetX;
+    int t = area.top  - g_offsetY;
+    int r = area.right - g_offsetX;
+    int b = area.bottom - g_offsetY;
+    l = (l < 0 ? 0 : l) - margin;
+    t = (t < 0 ? 0 : t) - margin;
+    r = (r > dw ? dw : r) + margin;
+    b = (b > dh ? dh : b) + margin;
+    if (l < 0) l = 0; if (t < 0) t = 0;
+    if (r > dw) r = dw; if (b > dh) b = dh;
+    if (r <= l || b <= t) return false;
+    *vl = l; *vt = t; *vr = r; *vb = b;
+    return true;
+}
+
 static void LayoutSvgPane(HWND hWnd) {
     if (!g_hSvgEdit || !g_isSvg) return;
     RECT rc; GetClientRect(hWnd, &rc);
@@ -444,6 +468,7 @@ static void CloseImage() {
     g_frameIndex = 0;
     g_svgViewW = g_svgViewH = 0;
     g_svgViewOffX = g_svgViewOffY = 0;
+    g_svgViewVX = g_svgViewVY = 0;
     g_imgW = g_imgH = 0;
     g_currentFile.clear();
     SetWindowTextW(g_hWnd, g_appTitle.c_str());
@@ -678,65 +703,76 @@ static void Paint(HWND hWnd) {
     DeleteObject(hbrBg);
 
     if (g_isSvg && g_svgTree) {
-        // Re-rasterize the vector SVG at the current zoom for crisp output
         int dw = (int)(g_imgW * g_zoom); if (dw < 1) dw = 1;
         int dh = (int)(g_imgH * g_zoom); if (dh < 1) dh = 1;
 
-        std::vector<BYTE> rgba((size_t)dw * dh * 4, 0);
-        resvg_transform t = resvg_transform_identity();
-        t.a = (float)dw / (float)g_imgW;
-        t.d = (float)dh / (float)g_imgH;
-        resvg_render(g_svgTree, t, (uint32_t)dw, (uint32_t)dh, (char*)rgba.data());
+        // Render only the visible region (view coords) to keep cost bounded to
+        // the on-screen pixels regardless of zoom.
+        int vl, vt, vr, vb;
+        if (!ComputeVisibleRect(dw, dh, &vl, &vt, &vr, &vb)) {
+            // nothing visible
+        } else {
+            int bw = vr - vl, bh = vb - vt;
 
-        // Cache rendered views (RGBA -> BGRA): raw for picking, composite for display
-        if (!g_svgView || g_svgViewW != dw || g_svgViewH != dh) {
-            delete[] g_svgView;
-            g_svgView = new BYTE[(size_t)dw * dh * 4];
-        }
-        if (!g_svgRaw || g_svgViewW != dw || g_svgViewH != dh) {
-            delete[] g_svgRaw;
-            g_svgRaw = new BYTE[(size_t)dw * dh * 4];
-        }
-        for (size_t i = 0; i < (size_t)dw * dh; i++) {
-            BYTE r = rgba[i * 4 + 0], g = rgba[i * 4 + 1];
-            BYTE b = rgba[i * 4 + 2], a = rgba[i * 4 + 3];
-            // Raw premultiplied BGRA (alpha preserved for color picking)
-            g_svgRaw[i * 4 + 0] = b;
-            g_svgRaw[i * 4 + 1] = g;
-            g_svgRaw[i * 4 + 2] = r;
-            g_svgRaw[i * 4 + 3] = a;
-            // Composite over a light checkerboard (premultiplied-over)
-            int x = (int)(i % dw), y = (int)(i / dw);
-            BYTE bc = (((x / 8) + (y / 8)) & 1) ? (BYTE)200 : (BYTE)255;
-            BYTE invA = (BYTE)(255 - a);
-            g_svgView[i * 4 + 0] = (BYTE)(b + bc * invA / 255);
-            g_svgView[i * 4 + 1] = (BYTE)(g + bc * invA / 255);
-            g_svgView[i * 4 + 2] = (BYTE)(r + bc * invA / 255);
-            g_svgView[i * 4 + 3] = 255;
-        }
-        g_svgViewW = dw; g_svgViewH = dh;
-        g_svgViewOffX = g_offsetX; g_svgViewOffY = g_offsetY;
+            std::vector<BYTE> rgba((size_t)bw * bh * 4, 0);
+            resvg_transform t = resvg_transform_identity();
+            t.a = (float)dw / (float)g_imgW;
+            t.d = (float)dh / (float)g_imgH;
+            t.e = (float)-vl;
+            t.f = (float)-vt;
+            resvg_render(g_svgTree, t, (uint32_t)bw, (uint32_t)bh, (char*)rgba.data());
 
-        BITMAPINFO bmi = {};
-        bmi.bmiHeader.biSize        = sizeof(BITMAPINFOHEADER);
-        bmi.bmiHeader.biWidth       = dw;
-        bmi.bmiHeader.biHeight      = -(int)dh; // top-down
-        bmi.bmiHeader.biPlanes      = 1;
-        bmi.bmiHeader.biBitCount    = 32;
-        bmi.bmiHeader.biCompression = BI_RGB;
+            // Cache rendered views (RGBA -> BGRA): raw for picking, composite for display
+            if (!g_svgView || g_svgViewW != bw || g_svgViewH != bh) {
+                delete[] g_svgView;
+                g_svgView = new BYTE[(size_t)bw * bh * 4];
+            }
+            if (!g_svgRaw || g_svgViewW != bw || g_svgViewH != bh) {
+                delete[] g_svgRaw;
+                g_svgRaw = new BYTE[(size_t)bw * bh * 4];
+            }
+            for (size_t i = 0; i < (size_t)bw * bh; i++) {
+                BYTE r = rgba[i * 4 + 0], g = rgba[i * 4 + 1];
+                BYTE b = rgba[i * 4 + 2], a = rgba[i * 4 + 3];
+                int vx = vl + (int)(i % bw);
+                int vy = vt + (int)(i / bw);
+                g_svgRaw[i * 4 + 0] = b;
+                g_svgRaw[i * 4 + 1] = g;
+                g_svgRaw[i * 4 + 2] = r;
+                g_svgRaw[i * 4 + 3] = a;
+                BYTE bc = (((vx / 8) + (vy / 8)) & 1) ? (BYTE)200 : (BYTE)255;
+                BYTE invA = (BYTE)(255 - a);
+                g_svgView[i * 4 + 0] = (BYTE)(b + bc * invA / 255);
+                g_svgView[i * 4 + 1] = (BYTE)(g + bc * invA / 255);
+                g_svgView[i * 4 + 2] = (BYTE)(r + bc * invA / 255);
+                g_svgView[i * 4 + 3] = 255;
+            }
+            g_svgViewW = bw; g_svgViewH = bh;
+            g_svgViewOffX = g_offsetX; g_svgViewOffY = g_offsetY;
+            g_svgViewVX = vl; g_svgViewVY = vt;
 
-        void* pBits = nullptr;
-        HBITMAP hbmImg = CreateDIBSection(hdcMem, &bmi, DIB_RGB_COLORS, &pBits, nullptr, 0);
-        if (hbmImg && pBits) {
-            memcpy(pBits, g_svgView, (size_t)dw * dh * 4);
-            HDC hdcImg = CreateCompatibleDC(hdcMem);
-            HBITMAP hbmOld = (HBITMAP)SelectObject(hdcImg, hbmImg);
-            SetStretchBltMode(hdcMem, HALFTONE);
-            SetBrushOrgEx(hdcMem, 0, 0, nullptr);
-            StretchBlt(hdcMem, g_offsetX, g_offsetY, dw, dh, hdcImg, 0, 0, dw, dh, SRCCOPY);
-            SelectObject(hdcImg, hbmOld);
-            DeleteDC(hdcImg);
-            DeleteObject(hbmImg);
+            BITMAPINFO bmi = {};
+            bmi.bmiHeader.biSize        = sizeof(BITMAPINFOHEADER);
+            bmi.bmiHeader.biWidth       = bw;
+            bmi.bmiHeader.biHeight      = -(int)bh; // top-down
+            bmi.bmiHeader.biPlanes      = 1;
+            bmi.bmiHeader.biBitCount    = 32;
+            bmi.bmiHeader.biCompression = BI_RGB;
+
+            void* pBits = nullptr;
+            HBITMAP hbmImg = CreateDIBSection(hdcMem, &bmi, DIB_RGB_COLORS, &pBits, nullptr, 0);
+            if (hbmImg && pBits) {
+                memcpy(pBits, g_svgView, (size_t)bw * bh * 4);
+                HDC hdcImg = CreateCompatibleDC(hdcMem);
+                HBITMAP hbmOld = (HBITMAP)SelectObject(hdcImg, hbmImg);
+                SetStretchBltMode(hdcMem, HALFTONE);
+                SetBrushOrgEx(hdcMem, 0, 0, nullptr);
+                StretchBlt(hdcMem, g_offsetX + vl, g_offsetY + vt, bw, bh,
+                           hdcImg, 0, 0, bw, bh, SRCCOPY);
+                SelectObject(hdcImg, hbmOld);
+                DeleteDC(hdcImg);
+                DeleteObject(hbmImg);
+            }
         }
     } else if ((g_pConverter || g_pComposite) && g_imgW > 0 && g_imgH > 0) {
         // Build the source pixels (image resolution, premultiplied BGRA)
@@ -752,54 +788,64 @@ static void Paint(HWND hWnd) {
             srcBits = src.data();
         }
 
-        // Rasterize at the zoomed resolution and index the checkerboard by the
-        // view coordinate (like SVG) so the pattern stays constant & crisp.
+        // Rasterize only the visible region at the zoomed resolution; index the
+        // checkerboard by the view coordinate (like SVG) so it stays constant.
         int dw = (int)(g_imgW * g_zoom); if (dw < 1) dw = 1;
         int dh = (int)(g_imgH * g_zoom); if (dh < 1) dh = 1;
 
-        BITMAPINFO bmi = {};
-        bmi.bmiHeader.biSize        = sizeof(BITMAPINFOHEADER);
-        bmi.bmiHeader.biWidth       = dw;
-        bmi.bmiHeader.biHeight      = -(int)dh; // top-down
-        bmi.bmiHeader.biPlanes      = 1;
-        bmi.bmiHeader.biBitCount    = 32;
-        bmi.bmiHeader.biCompression = BI_RGB;
+        int vl, vt, vr, vb;
+        if (!ComputeVisibleRect(dw, dh, &vl, &vt, &vr, &vb)) {
+            // nothing visible
+        } else {
+            int bw = vr - vl, bh = vb - vt;
 
-        void* pBits = nullptr;
-        HBITMAP hbmImg = CreateDIBSection(hdcMem, &bmi, DIB_RGB_COLORS, &pBits, nullptr, 0);
-        if (hbmImg && pBits) {
-            BYTE* dstBits = (BYTE*)pBits;
-            for (int vy = 0; vy < dh; vy++) {
-                double fy = vy * (double)g_imgH / dh;
-                for (int vx = 0; vx < dw; vx++) {
-                    double fx = vx * (double)g_imgW / dw;
-                    BYTE px[4];
-                    BilinearBGRA(srcBits, g_imgW, g_imgH, fx, fy, px);
-                    BYTE b = px[0], g = px[1], r = px[2], a = px[3];
-                    size_t i = ((size_t)vy * dw + vx) * 4;
-                    BYTE bc = (((vx / 8) + (vy / 8)) & 1) ? (BYTE)200 : (BYTE)255;
-                    if (a == 255) {
-                        dstBits[i + 0] = b; dstBits[i + 1] = g;
-                        dstBits[i + 2] = r; dstBits[i + 3] = 255;
-                    } else {
-                        BYTE invA = (BYTE)(255 - a);
-                        dstBits[i + 0] = (BYTE)(b + bc * invA / 255);
-                        dstBits[i + 1] = (BYTE)(g + bc * invA / 255);
-                        dstBits[i + 2] = (BYTE)(r + bc * invA / 255);
-                        dstBits[i + 3] = 255;
+            BITMAPINFO bmi = {};
+            bmi.bmiHeader.biSize        = sizeof(BITMAPINFOHEADER);
+            bmi.bmiHeader.biWidth       = bw;
+            bmi.bmiHeader.biHeight      = -(int)bh; // top-down
+            bmi.bmiHeader.biPlanes      = 1;
+            bmi.bmiHeader.biBitCount    = 32;
+            bmi.bmiHeader.biCompression = BI_RGB;
+
+            void* pBits = nullptr;
+            HBITMAP hbmImg = CreateDIBSection(hdcMem, &bmi, DIB_RGB_COLORS, &pBits, nullptr, 0);
+            if (hbmImg && pBits) {
+                BYTE* dstBits = (BYTE*)pBits;
+                for (int by = 0; by < bh; by++) {
+                    int vy = vt + by;
+                    double fy = vy * (double)g_imgH / dh;
+                    for (int bx = 0; bx < bw; bx++) {
+                        int vx = vl + bx;
+                        double fx = vx * (double)g_imgW / dw;
+                        BYTE px[4];
+                        BilinearBGRA(srcBits, g_imgW, g_imgH, fx, fy, px);
+                        BYTE b = px[0], g = px[1], r = px[2], a = px[3];
+                        size_t i = ((size_t)by * bw + bx) * 4;
+                        BYTE bc = (((vx / 8) + (vy / 8)) & 1) ? (BYTE)200 : (BYTE)255;
+                        if (a == 255) {
+                            dstBits[i + 0] = b; dstBits[i + 1] = g;
+                            dstBits[i + 2] = r; dstBits[i + 3] = 255;
+                        } else {
+                            BYTE invA = (BYTE)(255 - a);
+                            dstBits[i + 0] = (BYTE)(b + bc * invA / 255);
+                            dstBits[i + 1] = (BYTE)(g + bc * invA / 255);
+                            dstBits[i + 2] = (BYTE)(r + bc * invA / 255);
+                            dstBits[i + 3] = 255;
+                        }
                     }
                 }
-            }
 
-            // Draw 1:1 (already rasterized at zoom)
-            HDC hdcImg = CreateCompatibleDC(hdcMem);
-            HBITMAP hbmOld = (HBITMAP)SelectObject(hdcImg, hbmImg);
-            SetStretchBltMode(hdcMem, HALFTONE);
-            SetBrushOrgEx(hdcMem, 0, 0, nullptr);
-            StretchBlt(hdcMem, g_offsetX, g_offsetY, dw, dh, hdcImg, 0, 0, dw, dh, SRCCOPY);
-            SelectObject(hdcImg, hbmOld);
-            DeleteDC(hdcImg);
-            DeleteObject(hbmImg);
+                // Draw 1:1 (already rasterized at zoom)
+                HDC hdcImg = CreateCompatibleDC(hdcMem);
+                HBITMAP hbmOld = (HBITMAP)SelectObject(hdcImg, hbmImg);
+                SetStretchBltMode(hdcMem, HALFTONE);
+                SetBrushOrgEx(hdcMem, 0, 0, nullptr);
+                StretchBlt(hdcMem, g_offsetX + vl, g_offsetY + vt, bw, bh,
+                           hdcImg, 0, 0, bw, bh, SRCCOPY);
+                SelectObject(hdcImg, hbmOld);
+                DeleteDC(hdcImg);
+                DeleteObject(hbmImg);
+            }
         }
     }
 
@@ -881,14 +927,16 @@ static void UpdateStatusText() {
 static bool GetPixelAt(int cx, int cy, BYTE out[4]) {
     if (g_imgW == 0 || g_imgH == 0) return false;
     if (g_isSvg && g_svgTree) {
-        // Sample the cached raw raster (valid only when zoom/offset match)
-        int curDw = (int)(g_imgW * g_zoom), curDh = (int)(g_imgH * g_zoom);
-        if (!g_svgRaw || g_svgViewW != curDw || g_svgViewH != curDh) return false;
+        // Sample the cached raw raster of the visible region (valid when the
+        // view offset matches the last render).
+        if (!g_svgRaw) return false;
         if (g_svgViewOffX != g_offsetX || g_svgViewOffY != g_offsetY) return false;
         int vx = cx - g_offsetX;
         int vy = cy - g_offsetY;
-        if (vx < 0 || vy < 0 || vx >= curDw || vy >= curDh) return false;
-        memcpy(out, g_svgRaw + ((size_t)vy * curDw + vx) * 4, 4);
+        int bx = vx - g_svgViewVX;
+        int by = vy - g_svgViewVY;
+        if (bx < 0 || by < 0 || bx >= g_svgViewW || by >= g_svgViewH) return false;
+        memcpy(out, g_svgRaw + ((size_t)by * g_svgViewW + bx) * 4, 4);
         return true;
     }
     if (!g_pConverter && !g_pComposite) return false;
