@@ -109,6 +109,11 @@ static HWND        g_hBtnRotR = nullptr;
 static BYTE*       g_rotBuf = nullptr;
 static int         g_rot = 0;             // 0..3 quarter turns
 
+// HIG (single-channel grayscale) state
+static bool                g_isHig   = false;
+static int                 g_higBits = 0;
+static std::vector<DWORD>  g_higData;   // raw per-pixel value (for status display)
+
 // SVG state
 static resvg_render_tree* g_svgTree = nullptr;
 static bool               g_isSvg   = false;
@@ -132,7 +137,7 @@ static int         g_fileIndex = 0;
 
 // Suffixes the software can currently display (single source of truth)
 static const wchar_t* const g_imageExts[] = {
-    L"bmp", L"png", L"jpg", L"jpeg", L"gif", L"tiff", L"tif", L"ico", L"webp", L"svg"
+    L"bmp", L"png", L"jpg", L"jpeg", L"gif", L"tiff", L"tif", L"ico", L"webp", L"svg", L"hig"
 };
 static const int g_imageExtCount = (int)(sizeof(g_imageExts) / sizeof(g_imageExts[0]));
 
@@ -164,6 +169,7 @@ static bool      OpenImagePath(const wchar_t* path);
 static void      BrowseImage(HWND hWnd, int delta);
 static bool      LoadIcoPng(const wchar_t* path);
 static bool      LoadSvgFile(const wchar_t* path);
+static bool      LoadHigFile(const wchar_t* path);
 static void      GetImageArea(HWND hWnd, RECT* rc);
 static void      LayoutSvgPane(HWND hWnd);
 static void      MaterializeStaticSource();
@@ -199,6 +205,7 @@ static bool LoadImageFile(const wchar_t* path) {
         std::wstring ext = (dot != std::wstring::npos) ? spath.substr(dot + 1) : std::wstring();
         for (auto& c : ext) c = towlower(c);
         if (ext == L"svg") return LoadSvgFile(path);
+        if (ext == L"hig") return LoadHigFile(path);
     }
 
     IWICBitmapDecoder* pDecoder = nullptr;
@@ -316,6 +323,80 @@ static bool LoadIcoPng(const wchar_t* path) {
         return true;
     }
     return false;
+}
+
+// ---------------------------------------------------------------------------
+// HIG: single-channel grayscale (8/10/12/16-bit), custom header + raw data
+// ---------------------------------------------------------------------------
+// HIG_FILEHEADER offsets (MSVC default packing, 1048 bytes total):
+//   0 int nType, 4 int nWidth, 8 int nHeight, 12 int nBits, 16 int nColor,
+//   20 pName[32], 52 pDate[32], 84 pTime[32], 116 pNote[256], 372 pParam[256],
+//   884 nCount, 888 nBitsDisp, 892 nByteGraph, 896 dDPM, 904 dGamma,
+//   912 nGrayStart, 916 nGrayWidth, 920 nDataLen, 924 Reserved[31] -> 1048
+
+static BYTE HigGray(DWORD v, int width) {
+    if (width <= 0) width = 1;
+    double t = ((double)(int)v) * 255.0 / width;
+    if (t < 0) t = 0; if (t > 255) t = 255;
+    return (BYTE)(t + 0.5);
+}
+
+static bool LoadHigFile(const wchar_t* path) {
+    HANDLE h = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return false;
+    DWORD size = GetFileSize(h, nullptr);
+    if (size < 1048) { CloseHandle(h); return false; }
+    std::vector<BYTE> data(size);
+    DWORD rd = 0;
+    bool ok = ReadFile(h, data.data(), size, &rd, nullptr) != FALSE;
+    CloseHandle(h);
+    if (!ok) return false;
+
+    const BYTE* p = data.data();
+    auto rdi32 = [&](size_t o) -> int { return *(const int*)(p + o); };
+    int nType   = rdi32(0);
+    int nWidth  = rdi32(4);
+    int nHeight = rdi32(8);
+    int nBits   = rdi32(12);
+    int nGrayStart = rdi32(912);
+    int nGrayWidth = rdi32(916);
+
+    if (nType != 0x476948) return false; // 'HiG'
+    if (nWidth <= 0 || nHeight <= 0 || nBits <= 0) return false;
+
+    int bpp = (nBits <= 8) ? 1 : 2; // 10/12/16-bit stored as 16-bit words
+    size_t nPix = (size_t)nWidth * nHeight;
+    if (1048 + nPix * bpp > size) return false;
+
+    const BYTE* img = p + 1048;
+    std::vector<DWORD> raw(nPix);
+    for (size_t i = 0; i < nPix; i++) {
+        raw[i] = (bpp == 1) ? img[i] : ((WORD)img[i * 2] | ((WORD)img[i * 2 + 1] << 8));
+    }
+
+    // Display via window/level to 8-bit gray (opaque BGRA)
+    BYTE* buf = new BYTE[nPix * 4];
+    for (size_t i = 0; i < nPix; i++) {
+        BYTE g = HigGray(raw[i], nGrayWidth);
+        buf[i * 4 + 0] = g;
+        buf[i * 4 + 1] = g;
+        buf[i * 4 + 2] = g;
+        buf[i * 4 + 3] = 255;
+    }
+
+    CloseImage();
+    g_isHig = true;
+    g_higBits = nBits;
+    g_higData = std::move(raw);
+    g_pComposite = buf;
+    g_imgW = (UINT)nWidth;
+    g_imgH = (UINT)nHeight;
+    g_currentFile = path;
+    g_fitWindow = true;
+
+    std::wstring title = g_appTitle + L" - " + path;
+    SetWindowTextW(g_hWnd, title.c_str());
+    return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -476,6 +557,9 @@ static void CloseImage() {
     if (g_hWnd) KillTimer(g_hWnd, IDT_ANIM);
     g_isSvg = false;
     g_isGif = false;
+    g_isHig = false;
+    g_higBits = 0;
+    g_higData.clear();
     g_playing = false;
     g_frameCount = 1;
     g_frameIndex = 0;
@@ -984,8 +1068,14 @@ static void SetCursorStatus(int cx, int cy) {
     int ix = (int)((cx - g_offsetX) / g_zoom);
     int iy = (int)((cy - g_offsetY) / g_zoom);
     wchar_t buf[160];
-    swprintf_s(buf, L"(%d, %d)  R: %d G: %d B: %d A: %d",
-               ix, iy, px[2], px[1], px[0], px[3]);
+    if (g_isHig && ix >= 0 && iy >= 0 && ix < (int)g_imgW && iy < (int)g_imgH) {
+        DWORD v = g_higData[(size_t)iy * g_imgW + ix];
+        swprintf_s(buf, L"(%d, %d)  R: %d G: %d B: %d  |  %u-bit 灰度: %u",
+                   ix, iy, px[2], px[1], px[0], g_higBits, v);
+    } else {
+        swprintf_s(buf, L"(%d, %d)  R: %d G: %d B: %d A: %d",
+                   ix, iy, px[2], px[1], px[0], px[3]);
+    }
     SendMessageW(g_hStatusBar, SB_SETTEXTW, 1, (LPARAM)buf);
 }
 
@@ -1293,7 +1383,7 @@ static void DoBestFit(HWND hWnd) {
 // Materialize the static (non-animated, non-SVG) source into a persistent
 // BGRA buffer so we can rotate it in place.
 static void MaterializeStaticSource() {
-    if (g_isSvg || g_isGif) return;
+    if (g_isSvg || g_isGif || g_isHig) return;
     delete[] g_rotBuf; g_rotBuf = nullptr;
     g_rot = 0;
     if ((!g_pConverter && !g_pComposite) || g_imgW == 0 || g_imgH == 0) return;
@@ -1305,7 +1395,7 @@ static void MaterializeStaticSource() {
 
 static void RotateImage(HWND hWnd, bool clockwise) {
     SetFocus(hWnd);
-    if (g_isSvg || g_isGif) return; // only static images
+    if (g_isSvg || g_isGif || g_isHig) return; // only static images
     if (!g_rotBuf || g_imgW == 0 || g_imgH == 0) return;
     UINT W = g_imgW, H = g_imgH;
     std::vector<BYTE> out((size_t)W * H * 4);
