@@ -638,6 +638,26 @@ static void UpdateLayout(HWND hWnd) {
 // Painting – draw to back-buffer
 // ---------------------------------------------------------------------------
 
+// Bilinear sample a premultiplied BGRA source at fractional (fx, fy).
+static void BilinearBGRA(const BYTE* src, UINT sw, UINT sh, double fx, double fy, BYTE out[4]) {
+    int x0 = (int)fx, y0 = (int)fy;
+    int x1 = x0 + 1, y1 = y0 + 1;
+    if (x1 >= (int)sw) x1 = (int)sw - 1;
+    if (y1 >= (int)sh) y1 = (int)sh - 1;
+    double tx = fx - x0, ty = fy - y0;
+    const BYTE* p00 = src + ((size_t)y0 * sw + x0) * 4;
+    const BYTE* p10 = src + ((size_t)y0 * sw + x1) * 4;
+    const BYTE* p01 = src + ((size_t)y1 * sw + x0) * 4;
+    const BYTE* p11 = src + ((size_t)y1 * sw + x1) * 4;
+    for (int c = 0; c < 4; c++) {
+        double v = (1 - tx) * (1 - ty) * p00[c]
+                 + tx * (1 - ty) * p10[c]
+                 + (1 - tx) * ty * p01[c]
+                 + tx * ty * p11[c];
+        out[c] = (BYTE)(v + 0.5);
+    }
+}
+
 static void Paint(HWND hWnd) {
     PAINTSTRUCT ps;
     HDC hdc = BeginPaint(hWnd, &ps);
@@ -719,11 +739,28 @@ static void Paint(HWND hWnd) {
             DeleteObject(hbmImg);
         }
     } else if ((g_pConverter || g_pComposite) && g_imgW > 0 && g_imgH > 0) {
-        // Create DIB section from WIC bitmap
+        // Build the source pixels (image resolution, premultiplied BGRA)
+        UINT cbStride = g_imgW * 4;
+        UINT cbSize   = cbStride * g_imgH;
+        std::vector<BYTE> src;
+        const BYTE* srcBits;
+        if (g_pComposite) {
+            srcBits = g_pComposite;
+        } else {
+            src.resize(cbSize);
+            g_pConverter->CopyPixels(nullptr, cbStride, cbSize, src.data());
+            srcBits = src.data();
+        }
+
+        // Rasterize at the zoomed resolution and index the checkerboard by the
+        // view coordinate (like SVG) so the pattern stays constant & crisp.
+        int dw = (int)(g_imgW * g_zoom); if (dw < 1) dw = 1;
+        int dh = (int)(g_imgH * g_zoom); if (dh < 1) dh = 1;
+
         BITMAPINFO bmi = {};
         bmi.bmiHeader.biSize        = sizeof(BITMAPINFOHEADER);
-        bmi.bmiHeader.biWidth       = g_imgW;
-        bmi.bmiHeader.biHeight      = -(int)g_imgH; // top-down
+        bmi.bmiHeader.biWidth       = dw;
+        bmi.bmiHeader.biHeight      = -(int)dh; // top-down
         bmi.bmiHeader.biPlanes      = 1;
         bmi.bmiHeader.biBitCount    = 32;
         bmi.bmiHeader.biCompression = BI_RGB;
@@ -731,31 +768,20 @@ static void Paint(HWND hWnd) {
         void* pBits = nullptr;
         HBITMAP hbmImg = CreateDIBSection(hdcMem, &bmi, DIB_RGB_COLORS, &pBits, nullptr, 0);
         if (hbmImg && pBits) {
-            // Copy pixels from WIC (top-down to top-down, matching the DIB)
-            UINT cbStride = g_imgW * 4;
-            UINT cbSize   = cbStride * g_imgH;
-            const BYTE* srcBits;
-            std::vector<BYTE> tmp;
-            if (g_pComposite) {
-                srcBits = g_pComposite;
-            } else {
-                tmp.resize(cbSize);
-                g_pConverter->CopyPixels(nullptr, cbStride, cbSize, (BYTE*)tmp.data());
-                srcBits = tmp.data();
-            }
-            // Composite premultiplied BGRA over a light checkerboard so fully
-            // transparent (alpha=0) pixels are distinguishable from real black.
             BYTE* dstBits = (BYTE*)pBits;
-            for (UINT y = 0; y < g_imgH; y++) {
-                for (UINT x = 0; x < g_imgW; x++) {
-                    size_t i = ((size_t)y * g_imgW + x) * 4;
-                    BYTE b = srcBits[i + 0], g = srcBits[i + 1];
-                    BYTE r = srcBits[i + 2], a = srcBits[i + 3];
+            for (int vy = 0; vy < dh; vy++) {
+                double fy = vy * (double)g_imgH / dh;
+                for (int vx = 0; vx < dw; vx++) {
+                    double fx = vx * (double)g_imgW / dw;
+                    BYTE px[4];
+                    BilinearBGRA(srcBits, g_imgW, g_imgH, fx, fy, px);
+                    BYTE b = px[0], g = px[1], r = px[2], a = px[3];
+                    size_t i = ((size_t)vy * dw + vx) * 4;
+                    BYTE bc = (((vx / 8) + (vy / 8)) & 1) ? (BYTE)200 : (BYTE)255;
                     if (a == 255) {
                         dstBits[i + 0] = b; dstBits[i + 1] = g;
                         dstBits[i + 2] = r; dstBits[i + 3] = 255;
                     } else {
-                        BYTE bc = (((x / 8) + (y / 8)) & 1) ? (BYTE)200 : (BYTE)255;
                         BYTE invA = (BYTE)(255 - a);
                         dstBits[i + 0] = (BYTE)(b + bc * invA / 255);
                         dstBits[i + 1] = (BYTE)(g + bc * invA / 255);
@@ -765,15 +791,12 @@ static void Paint(HWND hWnd) {
                 }
             }
 
-            // Draw with StretchBlt from a DC that has the DIB selected
+            // Draw 1:1 (already rasterized at zoom)
             HDC hdcImg = CreateCompatibleDC(hdcMem);
             HBITMAP hbmOld = (HBITMAP)SelectObject(hdcImg, hbmImg);
             SetStretchBltMode(hdcMem, HALFTONE);
             SetBrushOrgEx(hdcMem, 0, 0, nullptr);
-            int dw = (int)(g_imgW * g_zoom);
-            int dh = (int)(g_imgH * g_zoom);
-            StretchBlt(hdcMem, g_offsetX, g_offsetY, dw, dh,
-                       hdcImg, 0, 0, g_imgW, g_imgH, SRCCOPY);
+            StretchBlt(hdcMem, g_offsetX, g_offsetY, dw, dh, hdcImg, 0, 0, dw, dh, SRCCOPY);
             SelectObject(hdcImg, hbmOld);
             DeleteDC(hdcImg);
             DeleteObject(hbmImg);
