@@ -1635,6 +1635,8 @@ static ATOM RegisterAppClass(HINSTANCE hInst) {
     wc.lpfnWndProc   = WndProc;
     wc.hInstance      = hInst;
     wc.hCursor        = LoadCursorW(nullptr, IDC_ARROW);
+    wc.hIcon          = LoadIconW(hInst, MAKEINTRESOURCE(1));
+    wc.hIconSm        = LoadIconW(hInst, MAKEINTRESOURCE(1));
     wc.hbrBackground  = (HBRUSH)(COLOR_WINDOW + 1);
     wc.lpszClassName  = L"ImgEyeWnd";
 

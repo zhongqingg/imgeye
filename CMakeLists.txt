@@ -9,7 +9,7 @@ if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release)
 endif()
 
-add_executable(imgeye WIN32 main.cpp)
+add_executable(imgeye WIN32 main.cpp ${CMAKE_CURRENT_SOURCE_DIR}/res/imgeye.rc)
 
 # resvg (SVG) - prebuilt static library
 target_include_directories(imgeye PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/third_party/resvg/include)
