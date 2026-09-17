@@ -36,6 +36,9 @@ extern const Lexilla::LexerModule lmXML;
 #define IDC_BTN_RATE 1004
 #define IDC_SVG_EDIT 1005
 #define IDC_BTN_FIT  1006
+#define IDC_BTN_ROTL 1007
+#define IDC_BTN_ROTR 1008
+#define IDC_BTN_SAVE 1009
 #define IDM_COPY_RGB 2001
 #define IDM_COPY_HEX 2002
 #define IDM_SAVE     2003
@@ -100,6 +103,13 @@ static HWND        g_hBtnNext = nullptr;
 static HWND        g_hBtnRate = nullptr;
 static HWND        g_hBtnFit = nullptr;   // "best fit" button (overlay on status bar)
 static HBITMAP     g_hBtnFitBmp = nullptr;
+static HWND        g_hBtnRotL = nullptr;  // rotate left / right / save
+static HWND        g_hBtnRotR = nullptr;
+static HWND        g_hBtnSave = nullptr;
+
+// Non-SVG rotation state (materialized BGRA buffer, rotated in place)
+static BYTE*       g_rotBuf = nullptr;
+static int         g_rot = 0;             // 0..3 quarter turns
 
 // SVG state
 static resvg_render_tree* g_svgTree = nullptr;
@@ -158,6 +168,10 @@ static bool      LoadIcoPng(const wchar_t* path);
 static bool      LoadSvgFile(const wchar_t* path);
 static void      GetImageArea(HWND hWnd, RECT* rc);
 static void      LayoutSvgPane(HWND hWnd);
+static void      MaterializeStaticSource();
+static void      RotateImage(HWND hWnd, bool clockwise);
+static bool      SaveImageFile(const wchar_t* path);
+static void      SaveImageDialog(HWND hWnd);
 static void      LoadSvgIntoEdit(const wchar_t* path);
 static void      SaveSvg(HWND hWnd);
 
@@ -459,6 +473,7 @@ static void CloseImage() {
     if (g_svgTree)   { resvg_tree_destroy(g_svgTree); g_svgTree = nullptr; }
     if (g_svgView)   { delete[] g_svgView; g_svgView = nullptr; }
     if (g_svgRaw)    { delete[] g_svgRaw; g_svgRaw = nullptr; }
+    if (g_rotBuf)    { delete[] g_rotBuf; g_rotBuf = nullptr; g_rot = 0; }
     if (g_hSvgEdit)  ShowWindow(g_hSvgEdit, SW_HIDE);
     if (g_hWnd) KillTimer(g_hWnd, IDT_ANIM);
     g_isSvg = false;
@@ -638,22 +653,27 @@ static void UpdateLayout(HWND hWnd) {
         // read its rect AFTER so the button/parts track the current window size.
         SendMessageW(g_hStatusBar, WM_SIZE, 0, 0);
 
-        // Reserve the right side of the status bar for the "best fit" button
+        // Reserve the right side of the status bar for the buttons
         RECT sbrc; GetClientRect(g_hStatusBar, &sbrc);
         int sbw = sbrc.right - sbrc.left;
-        const int btnW = 24, grip = 18;
-        int reserved = btnW + 12;
+        int sbh = sbrc.bottom - sbrc.top;
+        const int fitW = 24, txtW = 38, gap = 2, grip = 18;
+        bool showRot = (g_rotBuf != nullptr); // static (non-animated) image
+        int nRight = fitW + (showRot ? 3 * txtW : 0) + (showRot ? 3 * gap : 0) + 12;
+        int reserved = nRight + grip;
         int p0 = 320;
-        int p1 = sbw - reserved - grip;
+        int p1 = sbw - reserved;
         if (p1 < p0 + 40) p1 = p0 + 40;
         int parts[2] = { p0, p1 };
         SendMessageW(g_hStatusBar, SB_SETPARTS, 2, (LPARAM)parts);
 
-        // Position the fit button over the reserved area (status bar client coords)
-        if (g_hBtnFit) {
-            int sbh = sbrc.bottom - sbrc.top;
-            MoveWindow(g_hBtnFit, sbw - reserved - grip + 4, 2, btnW, sbh - 4, TRUE);
-        }
+        // Position buttons right-to-left (fit at the far right)
+        int x = sbw - grip - fitW;
+        if (g_hBtnFit) MoveWindow(g_hBtnFit, x, 2, fitW, sbh - 4, TRUE);
+        int show = showRot ? SW_SHOW : SW_HIDE;
+        if (g_hBtnSave) { ShowWindow(g_hBtnSave, show); if (showRot) { x -= txtW + gap; MoveWindow(g_hBtnSave, x, 2, txtW, sbh - 4, TRUE); } }
+        if (g_hBtnRotR) { ShowWindow(g_hBtnRotR, show); if (showRot) { x -= txtW + gap; MoveWindow(g_hBtnRotR, x, 2, txtW, sbh - 4, TRUE); } }
+        if (g_hBtnRotL) { ShowWindow(g_hBtnRotL, show); if (showRot) { x -= txtW + gap; MoveWindow(g_hBtnRotL, x, 2, txtW, sbh - 4, TRUE); } }
     }
     LayoutControls(hWnd);
     LayoutSvgPane(hWnd);
@@ -775,12 +795,15 @@ static void Paint(HWND hWnd) {
             }
         }
     } else if ((g_pConverter || g_pComposite) && g_imgW > 0 && g_imgH > 0) {
-        // Build the source pixels (image resolution, premultiplied BGRA)
+        // Build the source pixels (image resolution, premultiplied BGRA);
+        // prefer the rotated buffer when present.
         UINT cbStride = g_imgW * 4;
         UINT cbSize   = cbStride * g_imgH;
         std::vector<BYTE> src;
         const BYTE* srcBits;
-        if (g_pComposite) {
+        if (g_rotBuf) {
+            srcBits = g_rotBuf;
+        } else if (g_pComposite) {
             srcBits = g_pComposite;
         } else {
             src.resize(cbSize);
@@ -943,7 +966,9 @@ static bool GetPixelAt(int cx, int cy, BYTE out[4]) {
     int ix = (int)((cx - g_offsetX) / g_zoom);
     int iy = (int)((cy - g_offsetY) / g_zoom);
     if (ix < 0 || iy < 0 || ix >= (int)g_imgW || iy >= (int)g_imgH) return false;
-    if (g_pComposite) {
+    if (g_rotBuf) {
+        memcpy(out, g_rotBuf + ((size_t)iy * g_imgW + ix) * 4, 4);
+    } else if (g_pComposite) {
         memcpy(out, g_pComposite + ((size_t)iy * g_imgW + ix) * 4, 4);
     } else {
         WICRect rc = { ix, iy, 1, 1 };
@@ -1044,6 +1069,7 @@ static void BuildFileList(const wchar_t* path) {
 
 static bool OpenImagePath(const wchar_t* path) {
     if (!LoadImageFile(path)) return false;
+    MaterializeStaticSource();
     BuildFileList(path);
     UpdateLayout(g_hWnd);
     InvalidateRect(g_hWnd, nullptr, FALSE);
@@ -1056,6 +1082,7 @@ static void BrowseImage(HWND hWnd, int delta) {
     int idx = g_fileIndex + delta;
     if (idx < 0 || idx >= (int)g_fileList.size()) return;
     if (!LoadImageFile(g_fileList[idx].c_str())) return;
+    MaterializeStaticSource();
     g_fileIndex = idx;
     UpdateLayout(hWnd);
     InvalidateRect(hWnd, nullptr, FALSE);
@@ -1207,6 +1234,132 @@ static void DoBestFit(HWND hWnd) {
 }
 
 // ---------------------------------------------------------------------------
+// Non-SVG rotation / save
+// ---------------------------------------------------------------------------
+
+// Materialize the static (non-animated, non-SVG) source into a persistent
+// BGRA buffer so we can rotate it in place.
+static void MaterializeStaticSource() {
+    if (g_isSvg || g_isGif) return;
+    delete[] g_rotBuf; g_rotBuf = nullptr;
+    g_rot = 0;
+    if ((!g_pConverter && !g_pComposite) || g_imgW == 0 || g_imgH == 0) return;
+    size_t n = (size_t)g_imgW * g_imgH * 4;
+    g_rotBuf = new BYTE[n];
+    if (g_pComposite) memcpy(g_rotBuf, g_pComposite, n);
+    else g_pConverter->CopyPixels(nullptr, g_imgW * 4, n, g_rotBuf);
+}
+
+static void RotateImage(HWND hWnd, bool clockwise) {
+    SetFocus(hWnd);
+    if (g_isSvg || g_isGif) return; // only static images
+    if (!g_rotBuf || g_imgW == 0 || g_imgH == 0) return;
+    UINT W = g_imgW, H = g_imgH;
+    std::vector<BYTE> out((size_t)W * H * 4);
+    for (UINT y = 0; y < H; y++) {
+        for (UINT x = 0; x < W; x++) {
+            const BYTE* s = g_rotBuf + ((size_t)y * W + x) * 4;
+            BYTE* d;
+            if (clockwise)
+                d = out.data() + ((size_t)(W - 1 - x) * H + y) * 4;
+            else
+                d = out.data() + ((size_t)x * H + (H - 1 - y)) * 4;
+            memcpy(d, s, 4);
+        }
+    }
+    delete[] g_rotBuf;
+    g_rotBuf = new BYTE[(size_t)H * W * 4];
+    memcpy(g_rotBuf, out.data(), (size_t)H * W * 4);
+    g_imgW = H; g_imgH = W;
+    g_rot = (g_rot + (clockwise ? 1 : 3)) & 3;
+    g_fitWindow = true;
+    UpdateLayout(hWnd);
+    InvalidateRect(hWnd, nullptr, FALSE);
+    UpdateStatusText();
+}
+
+static bool SaveImageFile(const wchar_t* path) {
+    if ((!g_rotBuf && !g_pConverter && !g_pComposite) || g_imgW == 0 || g_imgH == 0) return false;
+    UINT W = g_imgW, H = g_imgH;
+
+    // Gather the (possibly rotated) current pixels as straight BGRA.
+    std::vector<BYTE> tmp((size_t)W * H * 4);
+    const BYTE* src;
+    if (g_rotBuf) {
+        src = g_rotBuf;
+    } else if (g_pComposite) {
+        src = g_pComposite;
+    } else {
+        std::vector<BYTE> raw((size_t)W * H * 4);
+        g_pConverter->CopyPixels(nullptr, W * 4, W * H * 4, raw.data());
+        src = raw.data();
+    }
+    // premultiplied -> straight
+    for (size_t i = 0; i < (size_t)W * H; i++) {
+        BYTE a = src[i * 4 + 3];
+        if (a == 255) {
+            tmp[i * 4 + 0] = src[i * 4 + 0];
+            tmp[i * 4 + 1] = src[i * 4 + 1];
+            tmp[i * 4 + 2] = src[i * 4 + 2];
+            tmp[i * 4 + 3] = 255;
+        } else if (a == 0) {
+            tmp[i * 4 + 0] = tmp[i * 4 + 1] = tmp[i * 4 + 2] = tmp[i * 4 + 3] = 0;
+        } else {
+            for (int c = 0; c < 3; c++)
+                tmp[i * 4 + c] = (BYTE)((int)src[i * 4 + c] * 255 / a);
+            tmp[i * 4 + 3] = a;
+        }
+    }
+
+    GUID container = GUID_ContainerFormatPng;
+    std::wstring p = path;
+    size_t dot = p.find_last_of(L'.');
+    std::wstring ext = (dot != std::wstring::npos) ? p.substr(dot + 1) : std::wstring();
+    for (auto& c : ext) c = towlower(c);
+    if (ext == L"jpg" || ext == L"jpeg") container = GUID_ContainerFormatJpeg;
+    else if (ext == L"bmp") container = GUID_ContainerFormatBmp;
+
+    IWICStream* stream = nullptr;
+    if (FAILED(g_pWICFactory->CreateStream(&stream))) return false;
+    if (FAILED(stream->InitializeFromFilename(path, GENERIC_WRITE))) { stream->Release(); return false; }
+    IWICBitmapEncoder* enc = nullptr;
+    if (FAILED(g_pWICFactory->CreateEncoder(container, nullptr, &enc))) { stream->Release(); return false; }
+    if (FAILED(enc->Initialize(stream, WICBitmapEncoderNoCache))) { enc->Release(); stream->Release(); return false; }
+    IWICBitmapFrameEncode* fr = nullptr;
+    IPropertyBag2* bag = nullptr;
+    if (FAILED(enc->CreateNewFrame(&fr, &bag))) { enc->Release(); stream->Release(); return false; }
+    fr->Initialize(bag);
+    fr->SetSize(W, H);
+    WICPixelFormatGUID pf = GUID_WICPixelFormat32bppBGRA;
+    fr->SetPixelFormat(&pf);
+    HRESULT hr = fr->WritePixels(H, W * 4, W * H * 4, tmp.data());
+    if (bag) bag->Release();
+    fr->Commit();
+    enc->Commit();
+    fr->Release(); enc->Release(); stream->Release();
+    return SUCCEEDED(hr);
+}
+
+static void SaveImageDialog(HWND hWnd) {
+    if ((!g_rotBuf && !g_pConverter && !g_pComposite) || g_imgW == 0) return;
+    wchar_t file[MAX_PATH] = {};
+    wcscpy_s(file, g_currentFile.c_str());
+    OPENFILENAMEW ofn = {};
+    ofn.lStructSize  = sizeof(ofn);
+    ofn.hwndOwner    = hWnd;
+    ofn.lpstrFilter  = L"PNG 图像\0*.png\0JPEG 图像\0*.jpg;*.jpeg\0BMP 图像\0*.bmp\0所有文件\0*.*\0";
+    ofn.lpstrFile    = file;
+    ofn.nMaxFile     = MAX_PATH;
+    ofn.Flags        = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST;
+    ofn.lpstrDefExt  = L"png";
+    ofn.lpstrTitle   = L"保存图像";
+    if (GetSaveFileNameW(&ofn)) {
+        if (!SaveImageFile(file))
+            MessageBoxW(hWnd, L"保存失败。", L"Error", MB_OK | MB_ICONERROR);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Drag-and-drop support
 // ---------------------------------------------------------------------------
 
@@ -1274,15 +1427,17 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int nCmdShow) {
         SetWindowSubclass(g_hStatusBar, StatusBarSubclass, 0, 0);
     }
 
-    // "Best fit" button (child of the status bar, always visible)
+// "Best fit" button (child of the status bar, always visible)
     g_hBtnFit = CreateWindowExW(0, L"BUTTON", L"",
         WS_CHILD | WS_VISIBLE | BS_BITMAP | BS_FLAT | BS_PUSHBUTTON,
         0, 0, 0, 0, g_hStatusBar, (HMENU)IDC_BTN_FIT, hInstance, nullptr);
     if (g_hBtnFit) {
         g_hBtnFitBmp = MakeFitIcon();
         if (g_hBtnFitBmp) SendMessageW(g_hBtnFit, BM_SETIMAGE, IMAGE_BITMAP, (LPARAM)g_hBtnFitBmp);
+    }
 
-        // Tooltip on hover
+    // Tooltip on the fit button
+    if (g_hBtnFit) {
         HWND hTip = CreateWindowExW(0, TOOLTIPS_CLASSW, nullptr,
             WS_POPUP | TTS_ALWAYSTIP,
             CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT,
@@ -1294,13 +1449,21 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int nCmdShow) {
             ti.hwnd     = g_hWnd;
             ti.uId      = (UINT_PTR)g_hBtnFit;
             ti.lpszText = L"适配窗口大小";
-            BOOL ok = SendMessageW(hTip, TTM_ADDTOOLW, 0, (LPARAM)&ti);
+            SendMessageW(hTip, TTM_ADDTOOLW, 0, (LPARAM)&ti);
             SendMessageW(hTip, TTM_SETMAXTIPWIDTH, 300, 0);
             HFONT hTipFont = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
             SendMessageW(hTip, WM_SETFONT, (WPARAM)hTipFont, TRUE);
-            (void)ok;
         }
     }
+
+    // Rotate / save buttons (child of the status bar, shown for static images)
+    DWORD tb = WS_CHILD | WS_VISIBLE | BS_FLAT | BS_PUSHBUTTON;
+    g_hBtnRotL = CreateWindowExW(0, L"BUTTON", L"左转",
+        tb, 0, 0, 0, 0, g_hStatusBar, (HMENU)IDC_BTN_ROTL, hInstance, nullptr);
+    g_hBtnRotR = CreateWindowExW(0, L"BUTTON", L"右转",
+        tb, 0, 0, 0, 0, g_hStatusBar, (HMENU)IDC_BTN_ROTR, hInstance, nullptr);
+    g_hBtnSave = CreateWindowExW(0, L"BUTTON", L"保存",
+        tb, 0, 0, 0, 0, g_hStatusBar, (HMENU)IDC_BTN_SAVE, hInstance, nullptr);
 
     // GIF control bar (hidden until a GIF is loaded)
     DWORD bstyle = WS_CHILD | BS_FLAT | BS_PUSHBUTTON;
@@ -1398,7 +1561,10 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             if (ctrl) OpenFile(hWnd);
             break;
         case 'S':
-            if (ctrl) SaveSvg(hWnd);
+            if (ctrl) {
+                if (g_isSvg) SaveSvg(hWnd);
+                else SaveImageDialog(hWnd);
+            }
             break;
         case VK_ADD:
         case '=':
@@ -1509,6 +1675,9 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             return 0;
         case IDC_BTN_RATE: CycleRate(hWnd); return 0;
         case IDC_BTN_FIT: DoBestFit(hWnd); return 0;
+        case IDC_BTN_ROTL: RotateImage(hWnd, false); return 0;
+        case IDC_BTN_ROTR: RotateImage(hWnd, true); return 0;
+        case IDC_BTN_SAVE: SaveImageDialog(hWnd); return 0;
         case IDM_COPY_RGB:
             if (g_ctxValid) {
                 wchar_t buf[32];
@@ -1524,7 +1693,8 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             }
             return 0;
         case IDM_SAVE:
-            SaveSvg(hWnd);
+            if (g_isSvg) SaveSvg(hWnd);
+            else SaveImageDialog(hWnd);
             return 0;
         }
         break;
