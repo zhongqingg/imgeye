@@ -107,6 +107,8 @@ static HWND        g_hBtnFit = nullptr;   // "best fit" button (overlay on statu
 static HBITMAP     g_hBtnFitBmp = nullptr;
 static HWND        g_hBtnRotL = nullptr;  // rotate left / right
 static HWND        g_hBtnRotR = nullptr;
+static HBITMAP     g_hBtnRotLBmp = nullptr;
+static HBITMAP     g_hBtnRotRBmp = nullptr;
 
 // Non-SVG rotation state (materialized BGRA buffer, rotated in place)
 static BYTE*       g_rotBuf = nullptr;
@@ -1285,7 +1287,7 @@ static void CenterWindow(HWND hWnd) {
 // to the main window (which owns the window procedure).
 static LRESULT CALLBACK StatusBarSubclass(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam,
                                           UINT_PTR uId, DWORD_PTR dwRef) {
-    if (msg == WM_COMMAND) {
+    if (msg == WM_COMMAND || msg == WM_DRAWITEM) {
         SendMessageW(GetParent(hwnd), msg, wParam, lParam);
         return 0;
     }
@@ -1743,12 +1745,11 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int nCmdShow) {
 
 // "Best fit" button (child of the status bar, always visible)
     g_hBtnFit = CreateWindowExW(0, L"BUTTON", L"",
-        WS_CHILD | WS_VISIBLE | BS_BITMAP | BS_FLAT | BS_PUSHBUTTON,
+        WS_CHILD | WS_VISIBLE | BS_OWNERDRAW | BS_PUSHBUTTON,
         0, 0, 0, 0, g_hStatusBar, (HMENU)IDC_BTN_FIT, hInstance, nullptr);
     if (g_hBtnFit) {
         g_hBtnFitBmp = MakeIconFromSvgResource(IDR_FIT, 24);
         if (!g_hBtnFitBmp) g_hBtnFitBmp = MakeFitIcon();
-        if (g_hBtnFitBmp) SendMessageW(g_hBtnFit, BM_SETIMAGE, IMAGE_BITMAP, (LPARAM)g_hBtnFitBmp);
     }
 
     // Tooltip on the fit button
@@ -1772,20 +1773,18 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int nCmdShow) {
     }
 
     // Rotate buttons (child of the status bar, shown for static images)
-    DWORD tb = WS_CHILD | WS_VISIBLE | BS_BITMAP | BS_FLAT | BS_PUSHBUTTON;
+    DWORD tb = WS_CHILD | WS_VISIBLE | BS_OWNERDRAW | BS_PUSHBUTTON;
     g_hBtnRotL = CreateWindowExW(0, L"BUTTON", L"",
         tb, 0, 0, 0, 0, g_hStatusBar, (HMENU)IDC_BTN_ROTL, hInstance, nullptr);
     g_hBtnRotR = CreateWindowExW(0, L"BUTTON", L"",
         tb, 0, 0, 0, 0, g_hStatusBar, (HMENU)IDC_BTN_ROTR, hInstance, nullptr);
     if (g_hBtnRotL) {
-        HBITMAP b = MakeIconFromSvgResource(IDR_ROTL, 24);
-        if (!b) b = MakeRotateIcon(false);
-        if (b) SendMessageW(g_hBtnRotL, BM_SETIMAGE, IMAGE_BITMAP, (LPARAM)b);
+        g_hBtnRotLBmp = MakeIconFromSvgResource(IDR_ROTL, 24);
+        if (!g_hBtnRotLBmp) g_hBtnRotLBmp = MakeRotateIcon(false);
     }
     if (g_hBtnRotR) {
-        HBITMAP b = MakeIconFromSvgResource(IDR_ROTR, 24);
-        if (!b) b = MakeRotateIcon(true);
-        if (b) SendMessageW(g_hBtnRotR, BM_SETIMAGE, IMAGE_BITMAP, (LPARAM)b);
+        g_hBtnRotRBmp = MakeIconFromSvgResource(IDR_ROTR, 24);
+        if (!g_hBtnRotRBmp) g_hBtnRotRBmp = MakeRotateIcon(true);
     }
 
     // GIF control bar (hidden until a GIF is loaded)
@@ -1855,6 +1854,8 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int nCmdShow) {
 
     ShutdownWIC();
     if (g_hBtnFitBmp) { DeleteObject(g_hBtnFitBmp); g_hBtnFitBmp = nullptr; }
+    if (g_hBtnRotLBmp) { DeleteObject(g_hBtnRotLBmp); g_hBtnRotLBmp = nullptr; }
+    if (g_hBtnRotRBmp) { DeleteObject(g_hBtnRotRBmp); g_hBtnRotRBmp = nullptr; }
     return (int)msg.wParam;
 }
 
@@ -1987,6 +1988,32 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 
     case WM_ERASEBKGND:
         return 1; // We handle background in Paint
+
+    case WM_DRAWITEM: {
+        const DRAWITEMSTRUCT* di = (const DRAWITEMSTRUCT*)lParam;
+        HBITMAP bmp = nullptr;
+        if (di->CtlID == IDC_BTN_FIT) bmp = g_hBtnFitBmp;
+        else if (di->CtlID == IDC_BTN_ROTL) bmp = g_hBtnRotLBmp;
+        else if (di->CtlID == IDC_BTN_ROTR) bmp = g_hBtnRotRBmp;
+        if (bmp) {
+            HDC hdc = di->hDC;
+            int bw = di->rcItem.right - di->rcItem.left;
+            int bh = di->rcItem.bottom - di->rcItem.top;
+            int x = (bw - 24) / 2;
+            int y = (bh - 24) / 2;
+            if (di->itemState & ODS_SELECTED) { x++; y++; }
+            HDC mem = CreateCompatibleDC(hdc);
+            HGDIOBJ old = SelectObject(mem, bmp);
+            BitBlt(hdc, x, y, 24, 24, mem, 0, 0, SRCCOPY);
+            SelectObject(mem, old);
+            DeleteDC(mem);
+            if (di->itemState & ODS_SELECTED) {
+                RECT r = di->rcItem;
+                DrawEdge(hdc, &r, EDGE_SUNKEN, BF_RECT);
+            }
+        }
+        return TRUE;
+    }
 
     case WM_COMMAND:
         switch (LOWORD(wParam)) {
