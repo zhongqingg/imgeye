@@ -38,6 +38,7 @@ extern const Lexilla::LexerModule lmXML;
 #define IDC_BTN_FIT  1006
 #define IDC_BTN_ROTL 1007
 #define IDC_BTN_ROTR 1008
+#define IDC_HIG_TRACK 1009
 #define IDR_FIT   101
 #define IDR_ROTL  102
 #define IDR_ROTR  103
@@ -117,6 +118,11 @@ static int         g_rot = 0;             // 0..3 quarter turns
 // HIG (custom single-channel grayscale)
 static bool                g_isHig = false;
 static std::vector<BYTE>   g_higHeader;  // original 1048-byte header (for saving)
+static int                 g_higWinWidth = 0; // window-width slider value (display only)
+static HWND                g_hTrackbar = nullptr;
+static HWND                g_hTrackTitle = nullptr;
+static HWND                g_hTrackMin = nullptr;
+static HWND                g_hTrackMax = nullptr;
 
 // Real per-pixel gray value (grayscale images: HIG, gray TIFF, etc.)
 static bool                g_hasRealGray = false;
@@ -180,6 +186,8 @@ static bool      LoadIcoPng(const wchar_t* path);
 static bool      LoadSvgFile(const wchar_t* path);
 static bool      LoadHigFile(const wchar_t* path);
 static void      CaptureRealGray();
+static void      HigApplyWindow();
+static void      HigSetupTrackbar();
 static void      GetImageArea(HWND hWnd, RECT* rc);
 static void      LayoutSvgPane(HWND hWnd);
 static void      MaterializeStaticSource();
@@ -352,6 +360,37 @@ static BYTE HigGray(DWORD v, int center, int width) {
     return (BYTE)(t + 0.5);
 }
 
+// Window-width display: values >= width map to 255, below map progressively.
+// Only affects the display buffer, never the real gray data.
+static void HigApplyWindow() {
+    if (!g_isHig || g_realGray.empty() || g_imgW == 0 || g_imgH == 0) return;
+    int w = g_higWinWidth; if (w <= 0) w = 1;
+    size_t n = (size_t)g_imgW * g_imgH;
+    if (!g_rotBuf) g_rotBuf = new BYTE[n * 4];
+    BYTE* dst = g_rotBuf;
+    for (size_t i = 0; i < n; i++) {
+        unsigned g = (unsigned)((DWORD)g_realGray[i] * 255u / (unsigned)w);
+        if (g > 255) g = 255;
+        dst[i * 4 + 0] = (BYTE)g;
+        dst[i * 4 + 1] = (BYTE)g;
+        dst[i * 4 + 2] = (BYTE)g;
+        dst[i * 4 + 3] = 255;
+    }
+}
+
+static void HigSetupTrackbar() {
+    if (!g_hTrackbar || !g_isHig) return;
+    const int kTrackMax = 32767; // trackbar max position
+    SendMessageW(g_hTrackbar, TBM_SETRANGE, TRUE, MAKELPARAM(0, kTrackMax));
+    SendMessageW(g_hTrackbar, TBM_SETPOS, TRUE, kTrackMax); // default = full range
+    int maxVal = (1 << g_realBits) - 1;
+    if (g_hTrackMax) {
+        wchar_t buf[16];
+        swprintf_s(buf, L"%d", maxVal);
+        SetWindowTextW(g_hTrackMax, buf);
+    }
+}
+
 static bool LoadHigFile(const wchar_t* path) {
     HANDLE h = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
     if (h == INVALID_HANDLE_VALUE) return false;
@@ -403,6 +442,7 @@ static bool LoadHigFile(const wchar_t* path) {
 
     CloseImage();
     g_isHig = true;
+    g_higWinWidth = maxVal; // default full-range display
     g_higHeader.assign(data.begin(), data.begin() + 1048);
     g_realBits = nBits;
     g_realGray = std::move(raw);
@@ -578,6 +618,8 @@ static void CloseImage() {
     g_isGif = false;
     g_isHig = false;
     g_higHeader.clear();
+    g_higWinWidth = 0;
+    if (g_hTrackbar) ShowWindow(g_hTrackbar, SW_HIDE);
     g_hasRealGray = false;
     g_realBits = 0;
     g_realGray.clear();
@@ -762,8 +804,11 @@ static void UpdateLayout(HWND hWnd) {
         int sbh = sbrc.bottom - sbrc.top;
         const int fitW = 24, txtW = 24, gap = 2, grip = 18;
         bool showRot = (g_rotBuf != nullptr); // any static (non-animated) image
+        bool showTrack = g_isHig && g_hTrackbar != nullptr;
+        const int titleW = 56, minW = 16, maxW = 40, trackW = 150, tgap = 4, trackGap = 8;
+        int trackRegion = showTrack ? (titleW + minW + trackW + maxW + tgap * 3) : 0;
         int nRight = fitW + (showRot ? 2 * (txtW + gap) : 0) + 12;
-        int reserved = nRight + grip;
+        int reserved = nRight + grip + (showTrack ? trackRegion + trackGap : 0);
         int p0 = 320;
         int p1 = sbw - reserved;
         if (p1 < p0 + 40) p1 = p0 + 40;
@@ -776,6 +821,25 @@ static void UpdateLayout(HWND hWnd) {
         int show = showRot ? SW_SHOW : SW_HIDE;
         if (g_hBtnRotR) { ShowWindow(g_hBtnRotR, show); if (showRot) { x -= txtW + gap; MoveWindow(g_hBtnRotR, x, 2, txtW, sbh - 4, TRUE); } }
         if (g_hBtnRotL) { ShowWindow(g_hBtnRotL, show); if (showRot) { x -= txtW + gap; MoveWindow(g_hBtnRotL, x, 2, txtW, sbh - 4, TRUE); } }
+
+        // HIG window-width trackbar (between the cursor pane and the buttons)
+        if (showTrack) {
+            int tx = p1 + 8;
+            int ty = (sbh - 14) / 2;
+            if (g_hTrackTitle) { ShowWindow(g_hTrackTitle, SW_SHOW); MoveWindow(g_hTrackTitle, tx, ty, titleW, 14, TRUE); }
+            tx += titleW;
+            if (g_hTrackMin)   { ShowWindow(g_hTrackMin, SW_SHOW);   MoveWindow(g_hTrackMin, tx, ty, minW, 14, TRUE); }
+            tx += minW + gap;
+            MoveWindow(g_hTrackbar, tx, (sbh - 18) / 2, trackW, 18, TRUE);
+            ShowWindow(g_hTrackbar, SW_SHOW);
+            tx += trackW + gap;
+            if (g_hTrackMax)   { ShowWindow(g_hTrackMax, SW_SHOW);   MoveWindow(g_hTrackMax, tx, ty, maxW, 14, TRUE); }
+        } else {
+            if (g_hTrackbar) ShowWindow(g_hTrackbar, SW_HIDE);
+            if (g_hTrackTitle) ShowWindow(g_hTrackTitle, SW_HIDE);
+            if (g_hTrackMin) ShowWindow(g_hTrackMin, SW_HIDE);
+            if (g_hTrackMax) ShowWindow(g_hTrackMax, SW_HIDE);
+        }
     }
     LayoutControls(hWnd);
     LayoutSvgPane(hWnd);
@@ -1033,6 +1097,8 @@ static void UpdateStatusText() {
         if (g_isGif) {
             swprintf_s(buf, L"%u x %u  |  %d%%  |  Frame %u/%u  |  %gx",
                        g_imgW, g_imgH, pct, g_frameIndex + 1, g_frameCount, g_playbackRate);
+        } else if (g_isHig) {
+            swprintf_s(buf, L"%u x %u  |  %d%%  |  窗宽: %d", g_imgW, g_imgH, pct, g_higWinWidth);
         } else {
             swprintf_s(buf, L"%u x %u  |  %d%%", g_imgW, g_imgH, pct);
         }
@@ -1179,6 +1245,7 @@ static bool OpenImagePath(const wchar_t* path) {
     if (!LoadImageFile(path)) return false;
     CaptureRealGray();
     MaterializeStaticSource();
+    if (g_isHig) { HigApplyWindow(); HigSetupTrackbar(); }
     BuildFileList(path);
     UpdateLayout(g_hWnd);
     InvalidateRect(g_hWnd, nullptr, FALSE);
@@ -1193,6 +1260,7 @@ static void BrowseImage(HWND hWnd, int delta) {
     if (!LoadImageFile(g_fileList[idx].c_str())) return;
     CaptureRealGray();
     MaterializeStaticSource();
+    if (g_isHig) { HigApplyWindow(); HigSetupTrackbar(); }
     g_fileIndex = idx;
     UpdateLayout(hWnd);
     InvalidateRect(hWnd, nullptr, FALSE);
@@ -1287,7 +1355,7 @@ static void CenterWindow(HWND hWnd) {
 // to the main window (which owns the window procedure).
 static LRESULT CALLBACK StatusBarSubclass(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam,
                                           UINT_PTR uId, DWORD_PTR dwRef) {
-    if (msg == WM_COMMAND || msg == WM_DRAWITEM) {
+    if (msg == WM_COMMAND || msg == WM_DRAWITEM || msg == WM_HSCROLL) {
         SendMessageW(GetParent(hwnd), msg, wParam, lParam);
         return 0;
     }
@@ -1464,10 +1532,11 @@ static void DoBestFit(HWND hWnd) {
 // Capture the real per-pixel gray value for grayscale (e.g. 16-bit TIFF)
 // decoded by WIC, so the status bar can show the true sample value.
 static void CaptureRealGray() {
+    if (g_isHig) return; // HIG already set its own real data; don't clear it
     g_hasRealGray = false;
     g_realGray.clear();
     g_realBits = 0;
-    if (g_isHig || !g_pFrame || g_imgW == 0 || g_imgH == 0) return;
+    if (!g_pFrame || g_imgW == 0 || g_imgH == 0) return;
     WICPixelFormatGUID pf;
     if (FAILED(g_pFrame->GetPixelFormat(&pf))) return;
     int bits = 0;
@@ -1787,6 +1856,24 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int nCmdShow) {
         if (!g_hBtnRotRBmp) g_hBtnRotRBmp = MakeRotateIcon(true);
     }
 
+    // HIG window-width trackbar (child of the status bar, shown only for HIG)
+    g_hTrackbar = CreateWindowExW(0, TRACKBAR_CLASSW, nullptr,
+        WS_CHILD | WS_VISIBLE | TBS_HORZ | TBS_NOTICKS,
+        0, 0, 0, 0, g_hStatusBar, (HMENU)IDC_HIG_TRACK, hInstance, nullptr);
+    if (g_hTrackbar) ShowWindow(g_hTrackbar, SW_HIDE);
+    g_hTrackTitle = CreateWindowExW(0, L"STATIC", L"调整窗宽:",
+        WS_CHILD | WS_VISIBLE | SS_CENTERIMAGE,
+        0, 0, 0, 0, g_hStatusBar, (HMENU)0, hInstance, nullptr);
+    g_hTrackMin = CreateWindowExW(0, L"STATIC", L"0",
+        WS_CHILD | WS_VISIBLE | SS_CENTER,
+        0, 0, 0, 0, g_hStatusBar, (HMENU)0, hInstance, nullptr);
+    g_hTrackMax = CreateWindowExW(0, L"STATIC", L"",
+        WS_CHILD | WS_VISIBLE | SS_CENTER,
+        0, 0, 0, 0, g_hStatusBar, (HMENU)0, hInstance, nullptr);
+    if (g_hTrackTitle) ShowWindow(g_hTrackTitle, SW_HIDE);
+    if (g_hTrackMin) ShowWindow(g_hTrackMin, SW_HIDE);
+    if (g_hTrackMax) ShowWindow(g_hTrackMax, SW_HIDE);
+
     // GIF control bar (hidden until a GIF is loaded)
     DWORD bstyle = WS_CHILD | BS_FLAT | BS_PUSHBUTTON;
     g_hBtnPrev = CreateWindowExW(0, L"BUTTON", L"<<",
@@ -2019,6 +2106,19 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         }
         return TRUE;
     }
+
+    case WM_HSCROLL:
+        if ((HWND)lParam == g_hTrackbar && g_isHig) {
+            const int kTrackMax = 32767;
+            int p = (int)SendMessageW(g_hTrackbar, TBM_GETPOS, 0, 0);
+            int maxVal = (1 << g_realBits) - 1;
+            g_higWinWidth = (int)((long long)p * maxVal / kTrackMax);
+            HigApplyWindow();
+            InvalidateRect(hWnd, nullptr, FALSE);
+            UpdateStatusText();
+            return 0;
+        }
+        break;
 
     case WM_COMMAND:
         switch (LOWORD(wParam)) {
