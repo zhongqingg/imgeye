@@ -384,6 +384,11 @@ static void HigSetupTrackbar() {
     SendMessageW(g_hTrackbar, TBM_SETRANGE, TRUE, MAKELPARAM(0, kTrackMax));
     SendMessageW(g_hTrackbar, TBM_SETPOS, TRUE, kTrackMax); // default = full range
     int maxVal = (1 << g_realBits) - 1;
+    // One wheel notch ~= 5 units of window width.
+    int step = (int)((long long)5 * kTrackMax / maxVal);
+    if (step < 1) step = 1;
+    SendMessageW(g_hTrackbar, TBM_SETLINESIZE, 0, step);
+    SendMessageW(g_hTrackbar, TBM_SETPAGESIZE, 0, step);
     if (g_hTrackMax) {
         wchar_t buf[16];
         swprintf_s(buf, L"%d", maxVal);
@@ -805,11 +810,11 @@ static void UpdateLayout(HWND hWnd) {
         const int fitW = 24, txtW = 24, gap = 2, grip = 18;
         bool showRot = (g_rotBuf != nullptr); // any static (non-animated) image
         bool showTrack = g_isHig && g_hTrackbar != nullptr;
-        const int titleW = 56, minW = 16, maxW = 40, trackW = 150, tgap = 4, trackGap = 8;
+        const int titleW = 96, minW = 16, maxW = 44, trackW = 150, tgap = 4, trackGap = 8;
         int trackRegion = showTrack ? (titleW + minW + trackW + maxW + tgap * 3) : 0;
         int nRight = fitW + (showRot ? 2 * (txtW + gap) : 0) + 12;
         int reserved = nRight + grip + (showTrack ? trackRegion + trackGap : 0);
-        int p0 = 320;
+        int p0 = 250;
         int p1 = sbw - reserved;
         if (p1 < p0 + 40) p1 = p0 + 40;
         int parts[2] = { p0, p1 };
@@ -823,17 +828,17 @@ static void UpdateLayout(HWND hWnd) {
         if (g_hBtnRotL) { ShowWindow(g_hBtnRotL, show); if (showRot) { x -= txtW + gap; MoveWindow(g_hBtnRotL, x, 2, txtW, sbh - 4, TRUE); } }
 
         // HIG window-width trackbar (between the cursor pane and the buttons)
-        if (showTrack) {
+if (showTrack) {
             int tx = p1 + 8;
-            int ty = (sbh - 14) / 2;
-            if (g_hTrackTitle) { ShowWindow(g_hTrackTitle, SW_SHOW); MoveWindow(g_hTrackTitle, tx, ty, titleW, 14, TRUE); }
+            int ty = (sbh - 16) / 2;
+            if (g_hTrackTitle) { ShowWindow(g_hTrackTitle, SW_SHOW); MoveWindow(g_hTrackTitle, tx, ty, titleW, 16, TRUE); }
             tx += titleW;
-            if (g_hTrackMin)   { ShowWindow(g_hTrackMin, SW_SHOW);   MoveWindow(g_hTrackMin, tx, ty, minW, 14, TRUE); }
-            tx += minW + gap;
+            if (g_hTrackMin)   { ShowWindow(g_hTrackMin, SW_SHOW);   MoveWindow(g_hTrackMin, tx, ty, minW, 16, TRUE); }
+            tx += minW + tgap;
             MoveWindow(g_hTrackbar, tx, (sbh - 18) / 2, trackW, 18, TRUE);
             ShowWindow(g_hTrackbar, SW_SHOW);
-            tx += trackW + gap;
-            if (g_hTrackMax)   { ShowWindow(g_hTrackMax, SW_SHOW);   MoveWindow(g_hTrackMax, tx, ty, maxW, 14, TRUE); }
+            tx += trackW + tgap;
+            if (g_hTrackMax)   { ShowWindow(g_hTrackMax, SW_SHOW);   MoveWindow(g_hTrackMax, tx, ty, maxW, 16, TRUE); }
         } else {
             if (g_hTrackbar) ShowWindow(g_hTrackbar, SW_HIDE);
             if (g_hTrackTitle) ShowWindow(g_hTrackTitle, SW_HIDE);
@@ -1157,8 +1162,7 @@ static void SetCursorStatus(int cx, int cy) {
     wchar_t buf[160];
     if (g_hasRealGray && ix >= 0 && iy >= 0 && ix < (int)g_imgW && iy < (int)g_imgH) {
         DWORD v = g_realGray[(size_t)iy * g_imgW + ix];
-        swprintf_s(buf, L"(%d, %d)  R: %d G: %d B: %d  |  %u-bit 灰度: %u",
-                   ix, iy, px[2], px[1], px[0], g_realBits, v);
+        swprintf_s(buf, L"(%d, %d)  %u-bit 灰度: %u", ix, iy, g_realBits, v);
     } else {
         swprintf_s(buf, L"(%d, %d)  R: %d G: %d B: %d A: %d",
                    ix, iy, px[2], px[1], px[0], px[3]);
@@ -1870,6 +1874,16 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int nCmdShow) {
     g_hTrackMax = CreateWindowExW(0, L"STATIC", L"",
         WS_CHILD | WS_VISIBLE | SS_CENTER,
         0, 0, 0, 0, g_hStatusBar, (HMENU)0, hInstance, nullptr);
+    // Normal-weight small font for the labels
+    {
+        HFONT hf = CreateFontW(-11, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+            DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+            DEFAULT_QUALITY, DEFAULT_PITCH, L"Microsoft YaHei");
+        if (!hf) hf = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
+        SendMessageW(g_hTrackTitle, WM_SETFONT, (WPARAM)hf, TRUE);
+        SendMessageW(g_hTrackMin,   WM_SETFONT, (WPARAM)hf, TRUE);
+        SendMessageW(g_hTrackMax,   WM_SETFONT, (WPARAM)hf, TRUE);
+    }
     if (g_hTrackTitle) ShowWindow(g_hTrackTitle, SW_HIDE);
     if (g_hTrackMin) ShowWindow(g_hTrackMin, SW_HIDE);
     if (g_hTrackMax) ShowWindow(g_hTrackMax, SW_HIDE);
