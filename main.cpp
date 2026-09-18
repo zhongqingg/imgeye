@@ -38,6 +38,9 @@ extern const Lexilla::LexerModule lmXML;
 #define IDC_BTN_FIT  1006
 #define IDC_BTN_ROTL 1007
 #define IDC_BTN_ROTR 1008
+#define IDR_FIT   101
+#define IDR_ROTL  102
+#define IDR_ROTR  103
 #define IDM_COPY_RGB 2001
 #define IDM_COPY_HEX 2002
 #define IDM_SAVE     2003
@@ -1345,6 +1348,64 @@ static HBITMAP MakeRotateIcon(bool clockwise) {
     return bmp;
 }
 
+// Rasterize an SVG embedded as an RCDATA resource into a button HBITMAP,
+// composited over the button face color. Returns null on any failure.
+static HBITMAP MakeIconFromSvgResource(UINT resId, int target) {
+    HRSRC hrs = FindResourceW(g_hInst, MAKEINTRESOURCE(resId), RT_RCDATA);
+    if (!hrs) return nullptr;
+    HGLOBAL hg = LoadResource(g_hInst, hrs);
+    if (!hg) return nullptr;
+    const char* data = (const char*)LockResource(hg);
+    DWORD len = SizeofResource(g_hInst, hrs);
+    if (!data || len == 0) return nullptr;
+
+    resvg_options* opt = resvg_options_create();
+    resvg_render_tree* tree = nullptr;
+    if (resvg_parse_tree_from_data(data, len, opt, &tree) != RESVG_OK) {
+        resvg_options_destroy(opt);
+        return nullptr;
+    }
+    resvg_size ns = resvg_get_image_size(tree);
+    resvg_options_destroy(opt);
+    double nat = (ns.width > 0) ? ns.width : (double)target;
+
+    int s = target;
+    std::vector<BYTE> rgba((size_t)s * s * 4, 0);
+    resvg_transform t = resvg_transform_identity();
+    t.a = (float)s / (float)nat;
+    t.d = (float)s / (float)nat;
+    resvg_render(tree, t, (uint32_t)s, (uint32_t)s, (char*)rgba.data());
+    resvg_tree_destroy(tree);
+
+    COLORREF face = GetSysColor(COLOR_BTNFACE);
+    BYTE fr = GetRValue(face), fg = GetGValue(face), fb = GetBValue(face);
+
+    HDC hdc = GetDC(nullptr);
+    BITMAPINFO bmi = {};
+    bmi.bmiHeader.biSize        = sizeof(BITMAPINFOHEADER);
+    bmi.bmiHeader.biWidth       = s;
+    bmi.bmiHeader.biHeight      = -s; // top-down
+    bmi.bmiHeader.biPlanes      = 1;
+    bmi.bmiHeader.biBitCount    = 32;
+    bmi.bmiHeader.biCompression = BI_RGB;
+    void* pBits = nullptr;
+    HBITMAP bmp = CreateDIBSection(hdc, &bmi, DIB_RGB_COLORS, &pBits, nullptr, 0);
+    if (bmp && pBits) {
+        BYTE* dst = (BYTE*)pBits;
+        for (size_t i = 0; i < (size_t)s * s; i++) {
+            BYTE r = rgba[i * 4 + 0], g = rgba[i * 4 + 1];
+            BYTE b = rgba[i * 4 + 2], a = rgba[i * 4 + 3];
+            BYTE invA = (BYTE)(255 - a);
+            dst[i * 4 + 0] = (BYTE)(b + fb * invA / 255);
+            dst[i * 4 + 1] = (BYTE)(g + fg * invA / 255);
+            dst[i * 4 + 2] = (BYTE)(r + fr * invA / 255);
+            dst[i * 4 + 3] = 255;
+        }
+    }
+    ReleaseDC(nullptr, hdc);
+    return bmp;
+}
+
 static HBITMAP MakeFitIcon() {
     const int s = 16;
     COLORREF face = GetSysColor(COLOR_BTNFACE);
@@ -1685,7 +1746,8 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int nCmdShow) {
         WS_CHILD | WS_VISIBLE | BS_BITMAP | BS_FLAT | BS_PUSHBUTTON,
         0, 0, 0, 0, g_hStatusBar, (HMENU)IDC_BTN_FIT, hInstance, nullptr);
     if (g_hBtnFit) {
-        g_hBtnFitBmp = MakeFitIcon();
+        g_hBtnFitBmp = MakeIconFromSvgResource(IDR_FIT, 24);
+        if (!g_hBtnFitBmp) g_hBtnFitBmp = MakeFitIcon();
         if (g_hBtnFitBmp) SendMessageW(g_hBtnFit, BM_SETIMAGE, IMAGE_BITMAP, (LPARAM)g_hBtnFitBmp);
     }
 
@@ -1716,11 +1778,13 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int nCmdShow) {
     g_hBtnRotR = CreateWindowExW(0, L"BUTTON", L"",
         tb, 0, 0, 0, 0, g_hStatusBar, (HMENU)IDC_BTN_ROTR, hInstance, nullptr);
     if (g_hBtnRotL) {
-        HBITMAP b = MakeRotateIcon(false);
+        HBITMAP b = MakeIconFromSvgResource(IDR_ROTL, 24);
+        if (!b) b = MakeRotateIcon(false);
         if (b) SendMessageW(g_hBtnRotL, BM_SETIMAGE, IMAGE_BITMAP, (LPARAM)b);
     }
     if (g_hBtnRotR) {
-        HBITMAP b = MakeRotateIcon(true);
+        HBITMAP b = MakeIconFromSvgResource(IDR_ROTR, 24);
+        if (!b) b = MakeRotateIcon(true);
         if (b) SendMessageW(g_hBtnRotR, BM_SETIMAGE, IMAGE_BITMAP, (LPARAM)b);
     }
 

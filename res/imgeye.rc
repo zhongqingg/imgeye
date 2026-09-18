@@ -1,1 +1,4 @@
 1 ICON "imgeye.ico"
+101 RCDATA "icons/fittowindow.svg"
+102 RCDATA "icons/rotate-left.svg"
+103 RCDATA "icons/rotate-right.svg"

@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+  <!-- 顺时针箭头 (右上角) -->
+  <polyline points="21 3 21 8 16 8" />
+  <!-- 顺时针旋转主弧线 -->
+  <path d="M 21 8 A 9 9 0 1 0 21 15" />
+</svg>

@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+  <!-- 四角窗口取景框 -->
+  <path d="M 3 7 V 3 H 7" />
+  <path d="M 17 3 H 21 V 7" />
+  <path d="M 21 17 V 21 H 17" />
+  <path d="M 7 21 H 3 V 17" />
+  <!-- 居中的图像画布 -->
+  <rect x="7" y="7" width="10" height="10" rx="1.5" stroke-width="2" />
+</svg>
