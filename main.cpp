@@ -1999,15 +1999,20 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             HDC hdc = di->hDC;
             int bw = di->rcItem.right - di->rcItem.left;
             int bh = di->rcItem.bottom - di->rcItem.top;
-            int x = (bw - 24) / 2;
-            int y = (bh - 24) / 2;
-            if (di->itemState & ODS_SELECTED) { x++; y++; }
+            bool pressed = (di->itemState & ODS_SELECTED) != 0;
+            int iw = 24, ih = 24;
+            if (pressed) { iw = 20; ih = 20; } // shrink slightly while pressed
+            int x = (bw - iw) / 2;
+            int y = (bh - ih) / 2;
+            if (pressed) { x++; y++; }
             HDC mem = CreateCompatibleDC(hdc);
             HGDIOBJ old = SelectObject(mem, bmp);
-            BitBlt(hdc, x, y, 24, 24, mem, 0, 0, SRCCOPY);
+            SetStretchBltMode(hdc, HALFTONE);
+            SetBrushOrgEx(hdc, 0, 0, nullptr);
+            StretchBlt(hdc, x, y, iw, ih, mem, 0, 0, 24, 24, SRCCOPY);
             SelectObject(mem, old);
             DeleteDC(mem);
-            if (di->itemState & ODS_SELECTED) {
+            if (pressed) {
                 RECT r = di->rcItem;
                 DrawEdge(hdc, &r, EDGE_SUNKEN, BF_RECT);
             }
