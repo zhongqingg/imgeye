@@ -2,3 +2,4 @@ build/
 .cache/
 testdata/
 log/
+installer/
