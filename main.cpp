@@ -363,7 +363,7 @@ static BYTE HigGray(DWORD v, int center, int width) {
 // Window-width display: values >= width map to 255, below map progressively.
 // Only affects the display buffer, never the real gray data.
 static void HigApplyWindow() {
-    if (!g_isHig || g_realGray.empty() || g_imgW == 0 || g_imgH == 0) return;
+    if (!g_hasRealGray || g_realGray.empty() || g_imgW == 0 || g_imgH == 0) return;
     int w = g_higWinWidth; if (w <= 0) w = 1;
     size_t n = (size_t)g_imgW * g_imgH;
     if (!g_rotBuf) g_rotBuf = new BYTE[n * 4];
@@ -379,7 +379,7 @@ static void HigApplyWindow() {
 }
 
 static void HigSetupTrackbar() {
-    if (!g_hTrackbar || !g_isHig) return;
+    if (!g_hTrackbar || !g_hasRealGray) return;
     const int kTrackMax = 32767; // trackbar max position
     SendMessageW(g_hTrackbar, TBM_SETRANGE, TRUE, MAKELPARAM(0, kTrackMax));
     SendMessageW(g_hTrackbar, TBM_SETPOS, TRUE, kTrackMax); // default = full range
@@ -809,7 +809,7 @@ static void UpdateLayout(HWND hWnd) {
         int sbh = sbrc.bottom - sbrc.top;
         const int fitW = 24, txtW = 24, gap = 2, grip = 18;
         bool showRot = (g_rotBuf != nullptr); // any static (non-animated) image
-        bool showTrack = g_isHig && g_hTrackbar != nullptr;
+        bool showTrack = g_hasRealGray && g_hTrackbar != nullptr;
         const int titleW = 96, minW = 16, maxW = 44, trackW = 150, tgap = 4, trackGap = 8;
         int trackRegion = showTrack ? (titleW + minW + trackW + maxW + tgap * 3) : 0;
         int nRight = fitW + (showRot ? 2 * (txtW + gap) : 0) + 12;
@@ -1102,7 +1102,7 @@ static void UpdateStatusText() {
         if (g_isGif) {
             swprintf_s(buf, L"%u x %u  |  %d%%  |  Frame %u/%u  |  %gx",
                        g_imgW, g_imgH, pct, g_frameIndex + 1, g_frameCount, g_playbackRate);
-        } else if (g_isHig) {
+        } else if (g_hasRealGray) {
             swprintf_s(buf, L"%u x %u  |  %d%%  |  窗宽: %d", g_imgW, g_imgH, pct, g_higWinWidth);
         } else {
             swprintf_s(buf, L"%u x %u  |  %d%%", g_imgW, g_imgH, pct);
@@ -1249,7 +1249,7 @@ static bool OpenImagePath(const wchar_t* path) {
     if (!LoadImageFile(path)) return false;
     CaptureRealGray();
     MaterializeStaticSource();
-    if (g_isHig) { HigApplyWindow(); HigSetupTrackbar(); }
+    if (g_hasRealGray) { HigApplyWindow(); HigSetupTrackbar(); }
     BuildFileList(path);
     UpdateLayout(g_hWnd);
     InvalidateRect(g_hWnd, nullptr, FALSE);
@@ -1264,7 +1264,7 @@ static void BrowseImage(HWND hWnd, int delta) {
     if (!LoadImageFile(g_fileList[idx].c_str())) return;
     CaptureRealGray();
     MaterializeStaticSource();
-    if (g_isHig) { HigApplyWindow(); HigSetupTrackbar(); }
+    if (g_hasRealGray) { HigApplyWindow(); HigSetupTrackbar(); }
     g_fileIndex = idx;
     UpdateLayout(hWnd);
     InvalidateRect(hWnd, nullptr, FALSE);
@@ -1557,6 +1557,7 @@ static void CaptureRealGray() {
         for (size_t i = 0; i < n; i++) g_realGray[i] = tmp[i * 2] | ((DWORD)tmp[i * 2 + 1] << 8);
     }
     g_realBits = bits;
+    g_higWinWidth = (1 << bits) - 1; // default window = full range
     g_hasRealGray = true;
 }
 
@@ -2122,7 +2123,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     }
 
     case WM_HSCROLL:
-        if ((HWND)lParam == g_hTrackbar && g_isHig) {
+        if ((HWND)lParam == g_hTrackbar && g_hasRealGray) {
             const int kTrackMax = 32767;
             int p = (int)SendMessageW(g_hTrackbar, TBM_GETPOS, 0, 0);
             int maxVal = (1 << g_realBits) - 1;
