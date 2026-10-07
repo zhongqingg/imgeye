@@ -126,7 +126,8 @@ static HWND                g_hTrackMax = nullptr;
 
 // Real per-pixel gray value (grayscale images: HIG, gray TIFF, etc.)
 static bool                g_hasRealGray = false;
-static int                 g_realBits = 0;
+static int                 g_realBits = 0;      // effective bit depth (for display)
+static int                 g_realMax = 0;        // effective max sample value (window max)
 static std::vector<DWORD>  g_realGray;   // raw sample value (for status display)
 
 // SVG state
@@ -383,7 +384,7 @@ static void HigSetupTrackbar() {
     const int kTrackMax = 32767; // trackbar max position
     SendMessageW(g_hTrackbar, TBM_SETRANGE, TRUE, MAKELPARAM(0, kTrackMax));
     SendMessageW(g_hTrackbar, TBM_SETPOS, TRUE, kTrackMax); // default = full range
-    int maxVal = (1 << g_realBits) - 1;
+    int maxVal = g_realMax > 0 ? g_realMax : ((1 << g_realBits) - 1);
     // One wheel notch ~= 5 units of window width.
     int step = (int)((long long)5 * kTrackMax / maxVal);
     if (step < 1) step = 1;
@@ -450,6 +451,7 @@ static bool LoadHigFile(const wchar_t* path) {
     g_higWinWidth = maxVal; // default full-range display
     g_higHeader.assign(data.begin(), data.begin() + 1048);
     g_realBits = nBits;
+    g_realMax = maxVal;
     g_realGray = std::move(raw);
     g_hasRealGray = true;
     g_pComposite = buf;
@@ -627,6 +629,7 @@ static void CloseImage() {
     if (g_hTrackbar) ShowWindow(g_hTrackbar, SW_HIDE);
     g_hasRealGray = false;
     g_realBits = 0;
+    g_realMax = 0;
     g_realGray.clear();
     g_playing = false;
     g_frameCount = 1;
@@ -1533,6 +1536,21 @@ static void DoBestFit(HWND hWnd) {
 // Non-SVG rotation / save
 // ---------------------------------------------------------------------------
 
+// Extract an unsigned integer from a PROPVARIANT (scalar or vector).
+static int PropToUInt(const PROPVARIANT& pv) {
+    switch (pv.vt) {
+    case VT_UI1: return pv.bVal;
+    case VT_UI2: return pv.uiVal;
+    case VT_UI4: return (int)pv.ulVal;
+    case VT_I1:  return pv.cVal;
+    case VT_I2:  return pv.iVal;
+    case VT_I4:  return (int)pv.lVal;
+    case VT_VECTOR | VT_UI2: return pv.caui.cElems ? pv.caui.pElems[0] : 0;
+    case VT_VECTOR | VT_UI4: return pv.caul.cElems ? (int)pv.caul.pElems[0] : 0;
+    default: return -1;
+    }
+}
+
 // Capture the real per-pixel gray value for grayscale (e.g. 16-bit TIFF)
 // decoded by WIC, so the status bar can show the true sample value.
 static void CaptureRealGray() {
@@ -1540,6 +1558,7 @@ static void CaptureRealGray() {
     g_hasRealGray = false;
     g_realGray.clear();
     g_realBits = 0;
+    g_realMax = 0;
     if (!g_pFrame || g_imgW == 0 || g_imgH == 0) return;
     WICPixelFormatGUID pf;
     if (FAILED(g_pFrame->GetPixelFormat(&pf))) return;
@@ -1556,8 +1575,36 @@ static void CaptureRealGray() {
         if (FAILED(g_pFrame->CopyPixels(nullptr, g_imgW * 2, (UINT)(n * 2), tmp.data()))) { g_realGray.clear(); return; }
         for (size_t i = 0; i < n; i++) g_realGray[i] = tmp[i * 2] | ((DWORD)tmp[i * 2 + 1] << 8);
     }
-    g_realBits = bits;
-    g_higWinWidth = (1 << bits) - 1; // default window = full range
+
+    // Effective range: prefer SMaxSampleValue (TIFF tag 341), else BitsPerSample
+    // (tag 258), else the storage bit depth. Handles e.g. 12-bit-in-16 TIFFs.
+    int realMax = (1 << bits) - 1;
+    IWICMetadataQueryReader* mr = nullptr;
+    if (SUCCEEDED(g_pFrame->GetMetadataQueryReader(&mr))) {
+        PROPVARIANT pv; PropVariantInit(&pv);
+        if (SUCCEEDED(mr->GetMetadataByName(L"/ifd/{ushort=341}", &pv))) {
+            int m = PropToUInt(pv);
+            if (m > 0) realMax = m;
+        }
+        PropVariantClear(&pv);
+        PropVariantInit(&pv);
+        if (SUCCEEDED(mr->GetMetadataByName(L"/ifd/{ushort=258}", &pv))) {
+            int b = PropToUInt(pv);
+            if (b > 0 && b <= 32) {
+                int m = (1 << b) - 1;
+                if (realMax == (1 << bits) - 1) realMax = m; // only if 341 absent
+            }
+        }
+        PropVariantClear(&pv);
+        mr->Release();
+    }
+    if (realMax < 1) realMax = 1;
+    int realBits = 0;
+    while ((1 << realBits) <= realMax) realBits++;
+
+    g_realBits = realBits;
+    g_realMax = realMax;
+    g_higWinWidth = realMax; // default window = full range
     g_hasRealGray = true;
 }
 
@@ -2126,7 +2173,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         if ((HWND)lParam == g_hTrackbar && g_hasRealGray) {
             const int kTrackMax = 32767;
             int p = (int)SendMessageW(g_hTrackbar, TBM_GETPOS, 0, 0);
-            int maxVal = (1 << g_realBits) - 1;
+            int maxVal = g_realMax > 0 ? g_realMax : ((1 << g_realBits) - 1);
             g_higWinWidth = (int)((long long)p * maxVal / kTrackMax);
             HigApplyWindow();
             InvalidateRect(hWnd, nullptr, FALSE);
