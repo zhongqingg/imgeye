@@ -2,3 +2,5 @@
 101 RCDATA "icons/fittowindow.svg"
 102 RCDATA "icons/rotate-left.svg"
 103 RCDATA "icons/rotate-right.svg"
+104 RCDATA "icons/fixed.svg"
+105 RCDATA "icons/unfixed.svg"

@@ -43,6 +43,8 @@ extern const Lexilla::LexerModule lmXML;
 #define IDR_FIT   101
 #define IDR_ROTL  102
 #define IDR_ROTR  103
+#define IDR_PIN_FIXED   104
+#define IDR_PIN_UNFIXED 105
 #define IDM_COPY_RGB 2001
 #define IDM_COPY_HEX 2002
 #define IDM_SAVE     2003
@@ -125,7 +127,8 @@ static HWND                g_hTrackTitle = nullptr;
 static HWND                g_hTrackMin = nullptr;
 static HWND                g_hTrackMax = nullptr;
 static HWND                g_hBtnPin = nullptr;      // pin: keep window width across images
-static HBITMAP             g_hBtnPinBmp = nullptr;
+static HBITMAP             g_hBtnPinBmp = nullptr;       // unfixed (flat) icon
+static HBITMAP             g_hBtnPinBmpFixed = nullptr;  // fixed (sunken) icon
 static bool                g_winFixed = false;        // pin state
 static int                 g_fixedWinWidth = 0;       // fixed window width value
 
@@ -1999,7 +2002,10 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int nCmdShow) {
         WS_CHILD | WS_VISIBLE | BS_OWNERDRAW | BS_PUSHBUTTON,
         0, 0, 0, 0, g_hStatusBar, (HMENU)IDC_BTN_PIN, hInstance, nullptr);
     if (g_hBtnPin) {
-        g_hBtnPinBmp = MakePinIcon();
+        g_hBtnPinBmp = MakeIconFromSvgResource(IDR_PIN_UNFIXED, 24);
+        if (!g_hBtnPinBmp) g_hBtnPinBmp = MakePinIcon();
+        g_hBtnPinBmpFixed = MakeIconFromSvgResource(IDR_PIN_FIXED, 24);
+        if (!g_hBtnPinBmpFixed) g_hBtnPinBmpFixed = g_hBtnPinBmp;
         ShowWindow(g_hBtnPin, SW_HIDE);
     }
 
@@ -2072,6 +2078,8 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int nCmdShow) {
     if (g_hBtnFitBmp) { DeleteObject(g_hBtnFitBmp); g_hBtnFitBmp = nullptr; }
     if (g_hBtnRotLBmp) { DeleteObject(g_hBtnRotLBmp); g_hBtnRotLBmp = nullptr; }
     if (g_hBtnRotRBmp) { DeleteObject(g_hBtnRotRBmp); g_hBtnRotRBmp = nullptr; }
+    if (g_hBtnPinBmpFixed && g_hBtnPinBmpFixed != g_hBtnPinBmp) { DeleteObject(g_hBtnPinBmpFixed); }
+    g_hBtnPinBmpFixed = nullptr;
     if (g_hBtnPinBmp) { DeleteObject(g_hBtnPinBmp); g_hBtnPinBmp = nullptr; }
     return (int)msg.wParam;
 }
@@ -2213,7 +2221,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         if (di->CtlID == IDC_BTN_FIT) bmp = g_hBtnFitBmp;
         else if (di->CtlID == IDC_BTN_ROTL) bmp = g_hBtnRotLBmp;
         else if (di->CtlID == IDC_BTN_ROTR) bmp = g_hBtnRotRBmp;
-        else if (di->CtlID == IDC_BTN_PIN) { bmp = g_hBtnPinBmp; toggleActive = g_winFixed; }
+        else if (di->CtlID == IDC_BTN_PIN) { bmp = g_winFixed ? g_hBtnPinBmpFixed : g_hBtnPinBmp; toggleActive = g_winFixed; }
         if (bmp) {
             HDC hdc = di->hDC;
             int bw = di->rcItem.right - di->rcItem.left;

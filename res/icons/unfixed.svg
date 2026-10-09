@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="64" height="64" fill="none">
+  <!-- 旋转35度编组 -->
+  <g transform="rotate(-35 12 12)">
+    <!-- 针尖（空心浅灰） -->
+    <path d="M12 15.5V21" stroke="#A1A1AA" stroke-width="1.8" stroke-linecap="round"/>
+    
+    <!-- 图钉主体（空心线框描边） -->
+    <path d="M8.5 3.5C8.5 3.22 8.72 3 9 3H15C15.28 3 15.5 3.22 15.5 3.5V5C15.5 5.28 15.28 5.5 15 5.5H14.2V9.2L16.8 13.8C16.95 14.07 16.76 14.5 16.45 14.5H7.55C7.24 14.5 7.05 14.07 7.2 13.8L9.8 9.2V5.5H9C8.72 5.5 8.5 5.28 8.5 5V3.5Z" 
+          fill="none" 
+          stroke="#52525B" 
+          stroke-width="1.8" 
+          stroke-linejoin="round" 
+          stroke-linecap="round"/>
+  </g>
+</svg>
