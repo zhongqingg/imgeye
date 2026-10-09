@@ -39,6 +39,7 @@ extern const Lexilla::LexerModule lmXML;
 #define IDC_BTN_ROTL 1007
 #define IDC_BTN_ROTR 1008
 #define IDC_HIG_TRACK 1009
+#define IDC_BTN_PIN  1010
 #define IDR_FIT   101
 #define IDR_ROTL  102
 #define IDR_ROTR  103
@@ -123,6 +124,10 @@ static HWND                g_hTrackbar = nullptr;
 static HWND                g_hTrackTitle = nullptr;
 static HWND                g_hTrackMin = nullptr;
 static HWND                g_hTrackMax = nullptr;
+static HWND                g_hBtnPin = nullptr;      // pin: keep window width across images
+static HBITMAP             g_hBtnPinBmp = nullptr;
+static bool                g_winFixed = false;        // pin state
+static int                 g_fixedWinWidth = 0;       // fixed window width value
 
 // Real per-pixel gray value (grayscale images: HIG, gray TIFF, etc.)
 static bool                g_hasRealGray = false;
@@ -189,6 +194,7 @@ static bool      LoadHigFile(const wchar_t* path);
 static void      CaptureRealGray();
 static void      HigApplyWindow();
 static void      HigSetupTrackbar();
+static void      ApplyFixedWindowIfPinned();
 static void      GetImageArea(HWND hWnd, RECT* rc);
 static void      LayoutSvgPane(HWND hWnd);
 static void      MaterializeStaticSource();
@@ -395,6 +401,21 @@ static void HigSetupTrackbar() {
         swprintf_s(buf, L"%d", maxVal);
         SetWindowTextW(g_hTrackMax, buf);
     }
+}
+
+// When pinned, apply the fixed window width to the current image (clamped to
+// its own max) and sync the slider.
+static void ApplyFixedWindowIfPinned() {
+    if (!g_winFixed || !g_hasRealGray || !g_hTrackbar) return;
+    const int kTrackMax = 32767;
+    int w = g_fixedWinWidth;
+    int maxVal = g_realMax > 0 ? g_realMax : ((1 << g_realBits) - 1);
+    if (w > maxVal) w = maxVal;
+    if (w < 0) w = 0;
+    g_higWinWidth = w;
+    int pos = (int)((long long)w * kTrackMax / maxVal);
+    SendMessageW(g_hTrackbar, TBM_SETPOS, TRUE, pos);
+    HigApplyWindow();
 }
 
 static bool LoadHigFile(const wchar_t* path) {
@@ -814,7 +835,8 @@ static void UpdateLayout(HWND hWnd) {
         bool showRot = (g_rotBuf != nullptr); // any static (non-animated) image
         bool showTrack = g_hasRealGray && g_hTrackbar != nullptr;
         const int titleW = 96, minW = 16, maxW = 44, trackW = 150, tgap = 4, trackGap = 8;
-        int trackRegion = showTrack ? (titleW + minW + trackW + maxW + tgap * 3) : 0;
+        const int pinW = 22;
+        int trackRegion = showTrack ? (pinW + tgap + titleW + minW + trackW + maxW + tgap * 3) : 0;
         int nRight = fitW + (showRot ? 2 * (txtW + gap) : 0) + 12;
         int reserved = nRight + grip + (showTrack ? trackRegion + trackGap : 0);
         int p0 = 250;
@@ -831,9 +853,11 @@ static void UpdateLayout(HWND hWnd) {
         if (g_hBtnRotL) { ShowWindow(g_hBtnRotL, show); if (showRot) { x -= txtW + gap; MoveWindow(g_hBtnRotL, x, 2, txtW, sbh - 4, TRUE); } }
 
         // HIG window-width trackbar (between the cursor pane and the buttons)
-if (showTrack) {
+        if (showTrack) {
             int tx = p1 + 8;
             int ty = (sbh - 16) / 2;
+            if (g_hBtnPin) { ShowWindow(g_hBtnPin, SW_SHOW); MoveWindow(g_hBtnPin, tx, 2, pinW, sbh - 4, TRUE); }
+            tx += pinW + tgap;
             if (g_hTrackTitle) { ShowWindow(g_hTrackTitle, SW_SHOW); MoveWindow(g_hTrackTitle, tx, ty, titleW, 16, TRUE); }
             tx += titleW;
             if (g_hTrackMin)   { ShowWindow(g_hTrackMin, SW_SHOW);   MoveWindow(g_hTrackMin, tx, ty, minW, 16, TRUE); }
@@ -847,6 +871,7 @@ if (showTrack) {
             if (g_hTrackTitle) ShowWindow(g_hTrackTitle, SW_HIDE);
             if (g_hTrackMin) ShowWindow(g_hTrackMin, SW_HIDE);
             if (g_hTrackMax) ShowWindow(g_hTrackMax, SW_HIDE);
+            if (g_hBtnPin) ShowWindow(g_hBtnPin, SW_HIDE);
         }
     }
     LayoutControls(hWnd);
@@ -1252,7 +1277,7 @@ static bool OpenImagePath(const wchar_t* path) {
     if (!LoadImageFile(path)) return false;
     CaptureRealGray();
     MaterializeStaticSource();
-    if (g_hasRealGray) { HigApplyWindow(); HigSetupTrackbar(); }
+    if (g_hasRealGray) { HigApplyWindow(); HigSetupTrackbar(); ApplyFixedWindowIfPinned(); }
     BuildFileList(path);
     UpdateLayout(g_hWnd);
     InvalidateRect(g_hWnd, nullptr, FALSE);
@@ -1267,7 +1292,7 @@ static void BrowseImage(HWND hWnd, int delta) {
     if (!LoadImageFile(g_fileList[idx].c_str())) return;
     CaptureRealGray();
     MaterializeStaticSource();
-    if (g_hasRealGray) { HigApplyWindow(); HigSetupTrackbar(); }
+    if (g_hasRealGray) { HigApplyWindow(); HigSetupTrackbar(); ApplyFixedWindowIfPinned(); }
     g_fileIndex = idx;
     UpdateLayout(hWnd);
     InvalidateRect(hWnd, nullptr, FALSE);
@@ -1479,6 +1504,39 @@ static HBITMAP MakeIconFromSvgResource(UINT resId, int target) {
             dst[i * 4 + 3] = 255;
         }
     }
+    ReleaseDC(nullptr, hdc);
+    return bmp;
+}
+
+// A pushpin icon: round head + needle.
+static HBITMAP MakePinIcon() {
+    const int s = 16;
+    COLORREF face = GetSysColor(COLOR_BTNFACE);
+    HDC hdc = GetDC(nullptr);
+    HDC hdcMem = CreateCompatibleDC(hdc);
+    HBITMAP bmp = CreateCompatibleBitmap(hdc, s, s);
+    if (!bmp) { DeleteDC(hdcMem); ReleaseDC(nullptr, hdc); return nullptr; }
+    HBITMAP old = (HBITMAP)SelectObject(hdcMem, bmp);
+    HBRUSH bg = CreateSolidBrush(face);
+    RECT rc = { 0, 0, s, s };
+    FillRect(hdcMem, &rc, bg);
+    DeleteObject(bg);
+    COLORREF fg = RGB(60, 60, 60);
+    HPEN pen = CreatePen(PS_SOLID, 1, fg);
+    HPEN oldPen = (HPEN)SelectObject(hdcMem, pen);
+    HBRUSH fgBrush = CreateSolidBrush(fg);
+    HBRUSH oldBrush = (HBRUSH)SelectObject(hdcMem, fgBrush);
+    // head
+    Ellipse(hdcMem, 5, 3, 11, 9);
+    // needle
+    MoveToEx(hdcMem, 8, 9, nullptr);
+    LineTo(hdcMem, 8, 14);
+    SelectObject(hdcMem, oldPen);
+    SelectObject(hdcMem, oldBrush);
+    DeleteObject(pen);
+    DeleteObject(fgBrush);
+    SelectObject(hdcMem, old);
+    DeleteDC(hdcMem);
     ReleaseDC(nullptr, hdc);
     return bmp;
 }
@@ -1936,6 +1994,15 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int nCmdShow) {
     if (g_hTrackMin) ShowWindow(g_hTrackMin, SW_HIDE);
     if (g_hTrackMax) ShowWindow(g_hTrackMax, SW_HIDE);
 
+    // Pin button (keep window width fixed across images), left of the slider UI
+    g_hBtnPin = CreateWindowExW(0, L"BUTTON", L"",
+        WS_CHILD | WS_VISIBLE | BS_OWNERDRAW | BS_PUSHBUTTON,
+        0, 0, 0, 0, g_hStatusBar, (HMENU)IDC_BTN_PIN, hInstance, nullptr);
+    if (g_hBtnPin) {
+        g_hBtnPinBmp = MakePinIcon();
+        ShowWindow(g_hBtnPin, SW_HIDE);
+    }
+
     // GIF control bar (hidden until a GIF is loaded)
     DWORD bstyle = WS_CHILD | BS_FLAT | BS_PUSHBUTTON;
     g_hBtnPrev = CreateWindowExW(0, L"BUTTON", L"<<",
@@ -2005,6 +2072,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int nCmdShow) {
     if (g_hBtnFitBmp) { DeleteObject(g_hBtnFitBmp); g_hBtnFitBmp = nullptr; }
     if (g_hBtnRotLBmp) { DeleteObject(g_hBtnRotLBmp); g_hBtnRotLBmp = nullptr; }
     if (g_hBtnRotRBmp) { DeleteObject(g_hBtnRotRBmp); g_hBtnRotRBmp = nullptr; }
+    if (g_hBtnPinBmp) { DeleteObject(g_hBtnPinBmp); g_hBtnPinBmp = nullptr; }
     return (int)msg.wParam;
 }
 
@@ -2141,14 +2209,17 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     case WM_DRAWITEM: {
         const DRAWITEMSTRUCT* di = (const DRAWITEMSTRUCT*)lParam;
         HBITMAP bmp = nullptr;
+        bool toggleActive = false;
         if (di->CtlID == IDC_BTN_FIT) bmp = g_hBtnFitBmp;
         else if (di->CtlID == IDC_BTN_ROTL) bmp = g_hBtnRotLBmp;
         else if (di->CtlID == IDC_BTN_ROTR) bmp = g_hBtnRotRBmp;
+        else if (di->CtlID == IDC_BTN_PIN) { bmp = g_hBtnPinBmp; toggleActive = g_winFixed; }
         if (bmp) {
             HDC hdc = di->hDC;
             int bw = di->rcItem.right - di->rcItem.left;
             int bh = di->rcItem.bottom - di->rcItem.top;
-            bool pressed = (di->itemState & ODS_SELECTED) != 0;
+            // Pinned state shows a persistent pressed look to distinguish on/off.
+            bool pressed = (di->itemState & ODS_SELECTED) != 0 || toggleActive;
             int iw = 24, ih = 24;
             if (pressed) { iw = 20; ih = 20; } // shrink slightly while pressed
             int x = (bw - iw) / 2;
@@ -2175,6 +2246,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             int p = (int)SendMessageW(g_hTrackbar, TBM_GETPOS, 0, 0);
             int maxVal = g_realMax > 0 ? g_realMax : ((1 << g_realBits) - 1);
             g_higWinWidth = (int)((long long)p * maxVal / kTrackMax);
+            if (g_winFixed) g_fixedWinWidth = g_higWinWidth; // keep fixed value in sync
             HigApplyWindow();
             InvalidateRect(hWnd, nullptr, FALSE);
             UpdateStatusText();
@@ -2194,6 +2266,11 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         case IDC_BTN_FIT: DoBestFit(hWnd); return 0;
         case IDC_BTN_ROTL: RotateImage(hWnd, false); return 0;
         case IDC_BTN_ROTR: RotateImage(hWnd, true); return 0;
+        case IDC_BTN_PIN:
+            g_winFixed = !g_winFixed;
+            if (g_winFixed) g_fixedWinWidth = g_higWinWidth; // capture current value
+            if (g_hBtnPin) InvalidateRect(g_hBtnPin, nullptr, TRUE);
+            return 0;
         case IDM_COPY_RGB:
             if (g_ctxValid) {
                 wchar_t buf[32];
