@@ -5,8 +5,8 @@
 [Setup]
 AppId={{8C24C33A-484D-4384-BB75-542B149BA988}
 AppName=Imgeye
-AppVersion=1.1.0
-AppVerName=Imgeye 1.1.0
+AppVersion=1.2.0
+AppVerName=Imgeye 1.2.0
 AppPublisher=Imgeye
 DefaultDirName={localappdata}\Programs\Imgeye
 DisableProgramGroupPage=yes
