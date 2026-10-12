@@ -140,7 +140,10 @@ static bool g_isTiff    = false;   // current file is .tif/.tiff
 static int  g_tool      = 0;       // 0=pan, 1=circle, 2=rect, 3=square
 static int  g_roiShape  = 0;       // shape shown: 0=none,1=circle,2=rect,3=square
 static int  g_roiX0 = 0, g_roiY0 = 0, g_roiX1 = 0, g_roiY1 = 0; // image coords
-static bool g_roiDragging = false;
+static int  g_roiMode = 0;      // 0=none, 1=create, 2=resize, 3=move
+static int  g_roiHandle = -1;   // active resize handle (0..7)
+static int  g_roiDragIx = 0, g_roiDragIy = 0;                 // drag start (image coords)
+static int  g_roiOrigL = 0, g_roiOrigT = 0, g_roiOrigR = 0, g_roiOrigB = 0; // bbox at drag start
 static HWND g_hToolPan = nullptr, g_hToolCircle = nullptr, g_hToolRect = nullptr, g_hToolSquare = nullptr;
 static bool                g_winFixed = false;        // pin state
 static int                 g_fixedWinWidth = 0;       // fixed window width value
@@ -638,7 +641,111 @@ static RoiStats ComputeRoiStats() {
 static void ResetRoi() {
     g_roiShape = 0;
     g_roiX0 = g_roiY0 = g_roiX1 = g_roiY1 = 0;
-    g_roiDragging = false;
+    g_roiMode = 0;
+    g_roiHandle = -1;
+}
+
+// --- ROI geometry helpers (resize handles / move) ---
+
+static void GetRoiBBox(int* l, int* t, int* r, int* b) {
+    *l = g_roiX0 < g_roiX1 ? g_roiX0 : g_roiX1;
+    *r = g_roiX0 < g_roiX1 ? g_roiX1 : g_roiX0;
+    *t = g_roiY0 < g_roiY1 ? g_roiY0 : g_roiY1;
+    *b = g_roiY0 < g_roiY1 ? g_roiY1 : g_roiY0;
+}
+
+static void SetRoiBBox(int l, int t, int r, int b) {
+    if (l > r) { int s = l; l = r; r = s; }
+    if (t > b) { int s = t; t = b; b = s; }
+    g_roiX0 = l; g_roiY0 = t; g_roiX1 = r; g_roiY1 = b;
+}
+
+// Screen position of handle h (0=TL,1=T,2=TR,3=R,4=BR,5=B,6=BL,7=L).
+static bool HandleScreenPos(int h, int* sx, int* sy) {
+    if (!g_statsMode || g_roiShape == 0) return false;
+    int l, t, r, b; GetRoiBBox(&l, &t, &r, &b);
+    int sl = g_offsetX + (int)(l * g_zoom), st = g_offsetY + (int)(t * g_zoom);
+    int sr = g_offsetX + (int)(r * g_zoom), sb = g_offsetY + (int)(b * g_zoom);
+    int mx = (sl + sr) / 2, my = (st + sb) / 2;
+    switch (h) {
+    case 0: *sx = sl; *sy = st; break;
+    case 1: *sx = mx; *sy = st; break;
+    case 2: *sx = sr; *sy = st; break;
+    case 3: *sx = sr; *sy = my; break;
+    case 4: *sx = sr; *sy = sb; break;
+    case 5: *sx = mx; *sy = sb; break;
+    case 6: *sx = sl; *sy = sb; break;
+    case 7: *sx = sl; *sy = my; break;
+    default: return false;
+    }
+    return true;
+}
+
+static int HitTestHandle(int cx, int cy) {
+    for (int h = 0; h < 8; h++) {
+        if (g_roiShape == 3 && (h & 1)) continue; // square: corner handles only
+        int sx, sy;
+        if (!HandleScreenPos(h, &sx, &sy)) continue;
+        if (cx >= sx - 4 && cx <= sx + 4 && cy >= sy - 4 && cy <= sy + 4) return h;
+    }
+    return -1;
+}
+
+static HCURSOR HandleCursor(int h) {
+    switch (h) {
+    case 0: case 4: return LoadCursorW(nullptr, IDC_SIZENWSE);
+    case 2: case 6: return LoadCursorW(nullptr, IDC_SIZENESW);
+    case 1: case 5: return LoadCursorW(nullptr, IDC_SIZENS);
+    case 3: case 7: return LoadCursorW(nullptr, IDC_SIZEWE);
+    }
+    return LoadCursorW(nullptr, IDC_ARROW);
+}
+
+static bool InsideRoi(int cx, int cy) {
+    if (!g_statsMode || g_roiShape == 0) return false;
+    int ix = (int)((cx - g_offsetX) / g_zoom), iy = (int)((cy - g_offsetY) / g_zoom);
+    int l, t, r, b; GetRoiBBox(&l, &t, &r, &b);
+    return ix >= l && ix <= r && iy >= t && iy <= b;
+}
+
+static void CaptureRoiOrigin(int ix, int iy) {
+    GetRoiBBox(&g_roiOrigL, &g_roiOrigT, &g_roiOrigR, &g_roiOrigB);
+    g_roiDragIx = ix; g_roiDragIy = iy;
+}
+
+static void ResizeRoiFromHandle(int h, int ix, int iy) {
+    int l = g_roiOrigL, t = g_roiOrigT, r = g_roiOrigR, b = g_roiOrigB;
+    if (g_roiShape == 3) { // square: anchor at the opposite corner, keep square
+        int ax, ay;
+        switch (h) {
+        case 0: ax = r; ay = b; break;
+        case 2: ax = l; ay = b; break;
+        case 4: ax = l; ay = t; break;
+        case 6: ax = r; ay = t; break;
+        default: return;
+        }
+        int dx = ix - ax, dy = iy - ay;
+        int adx = dx < 0 ? -dx : dx, ady = dy < 0 ? -dy : dy;
+        int s = adx > ady ? adx : ady;
+        int nx = ax + (dx < 0 ? -s : s), ny = ay + (dy < 0 ? -s : s);
+        SetRoiBBox(ax, ay, nx, ny);
+        return;
+    }
+    switch (h) {
+    case 0: l = ix; t = iy; break;
+    case 1: t = iy; break;
+    case 2: r = ix; t = iy; break;
+    case 3: r = ix; break;
+    case 4: r = ix; b = iy; break;
+    case 5: b = iy; break;
+    case 6: l = ix; b = iy; break;
+    case 7: l = ix; break;
+    }
+    SetRoiBBox(l, t, r, b);
+}
+
+static void MoveRoi(int dIx, int dIy) {
+    SetRoiBBox(g_roiOrigL + dIx, g_roiOrigT + dIy, g_roiOrigR + dIx, g_roiOrigB + dIy);
 }
 
 // Compute the visible sub-region (in view coordinates) of a dw x dh image
@@ -1206,6 +1313,23 @@ static void Paint(HWND hWnd) {
         SelectObject(hdcMem, oldPen);
         SelectObject(hdcMem, oldBr);
         DeleteObject(pen);
+
+        // Resize handles
+        HBRUSH hbrHandle = CreateSolidBrush(RGB(255, 255, 255));
+        HPEN hpenHandle = CreatePen(PS_SOLID, 1, RGB(255, 70, 70));
+        HBRUSH ob = (HBRUSH)SelectObject(hdcMem, hbrHandle);
+        HPEN opn = (HPEN)SelectObject(hdcMem, hpenHandle);
+        for (int h = 0; h < 8; h++) {
+            if (g_roiShape == 3 && (h & 1)) continue; // square: corners only
+            int hx, hy;
+            if (!HandleScreenPos(h, &hx, &hy)) continue;
+            RECT hr = { hx - 3, hy - 3, hx + 4, hy + 4 };
+            Rectangle(hdcMem, hr.left, hr.top, hr.right, hr.bottom);
+        }
+        SelectObject(hdcMem, ob);
+        SelectObject(hdcMem, opn);
+        DeleteObject(hbrHandle);
+        DeleteObject(hpenHandle);
     }
 
     // Stats sidebar
@@ -2372,22 +2496,39 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 
     case WM_LBUTTONDOWN: {
         SetFocus(hWnd); // blur the SVG edit pane so arrow keys browse images
+        int cx = GET_X_LPARAM(lParam), cy = GET_Y_LPARAM(lParam);
+        if (g_statsMode && g_roiShape != 0) {
+            int h = HitTestHandle(cx, cy);
+            bool shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
+            if (h >= 0) { // resize via a handle
+                CaptureRoiOrigin((int)((cx - g_offsetX) / g_zoom), (int)((cy - g_offsetY) / g_zoom));
+                g_roiMode = 2; g_roiHandle = h;
+                SetCapture(hWnd);
+                return 0;
+            }
+            if (shift && InsideRoi(cx, cy)) { // move the shape
+                CaptureRoiOrigin((int)((cx - g_offsetX) / g_zoom), (int)((cy - g_offsetY) / g_zoom));
+                g_roiMode = 3;
+                SetCapture(hWnd);
+                return 0;
+            }
+        }
         if (g_statsMode && g_tool != 0) {
-            // Start drawing an ROI
-            int ix = (int)((GET_X_LPARAM(lParam) - g_offsetX) / g_zoom);
-            int iy = (int)((GET_Y_LPARAM(lParam) - g_offsetY) / g_zoom);
+            // Start drawing a new ROI
+            int ix = (int)((cx - g_offsetX) / g_zoom);
+            int iy = (int)((cy - g_offsetY) / g_zoom);
             g_roiShape = g_tool;
             g_roiX0 = g_roiX1 = ix;
             g_roiY0 = g_roiY1 = iy;
-            g_roiDragging = true;
+            g_roiMode = 1;
             SetCapture(hWnd);
             InvalidateRect(hWnd, nullptr, FALSE);
             return 0;
         }
         SetCapture(hWnd);
         g_dragging = true;
-        g_dragStart.x = GET_X_LPARAM(lParam);
-        g_dragStart.y = GET_Y_LPARAM(lParam);
+        g_dragStart.x = cx;
+        g_dragStart.y = cy;
         g_dragOffX = g_offsetX;
         g_dragOffY = g_offsetY;
         return 0;
@@ -2396,7 +2537,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     case WM_MOUSEMOVE: {
         int mx = GET_X_LPARAM(lParam);
         int my = GET_Y_LPARAM(lParam);
-        if (g_roiDragging) {
+        if (g_roiMode == 1) {
             int ix = (int)((mx - g_offsetX) / g_zoom);
             int iy = (int)((my - g_offsetY) / g_zoom);
             if (g_roiShape == 3) { // square: constrain to a square
@@ -2408,6 +2549,13 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             g_roiX1 = ix;
             g_roiY1 = iy;
             InvalidateRect(hWnd, nullptr, FALSE);
+        } else if (g_roiMode == 2) {
+            ResizeRoiFromHandle(g_roiHandle, (int)((mx - g_offsetX) / g_zoom), (int)((my - g_offsetY) / g_zoom));
+            InvalidateRect(hWnd, nullptr, FALSE);
+        } else if (g_roiMode == 3) {
+            int ix = (int)((mx - g_offsetX) / g_zoom), iy = (int)((my - g_offsetY) / g_zoom);
+            MoveRoi(ix - g_roiDragIx, iy - g_roiDragIy);
+            InvalidateRect(hWnd, nullptr, FALSE);
         } else if (g_dragging) {
             g_offsetX = g_dragOffX + (mx - g_dragStart.x);
             g_offsetY = g_dragOffY + (my - g_dragStart.y);
@@ -2418,9 +2566,22 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     }
 
     case WM_LBUTTONUP:
-        if (g_roiDragging) { ReleaseCapture(); g_roiDragging = false; return 0; }
+        if (g_roiMode != 0) { ReleaseCapture(); g_roiMode = 0; g_roiHandle = -1; return 0; }
         if (g_dragging) { ReleaseCapture(); g_dragging = false; }
         return 0;
+
+    case WM_SETCURSOR: {
+        if (LOWORD(lParam) == HTCLIENT && g_statsMode && g_roiShape != 0 && g_roiMode == 0) {
+            POINT p; GetCursorPos(&p); ScreenToClient(hWnd, &p);
+            int h = HitTestHandle(p.x, p.y);
+            if (h >= 0) { SetCursor(HandleCursor(h)); return TRUE; }
+            if ((GetKeyState(VK_SHIFT) & 0x8000) && InsideRoi(p.x, p.y)) {
+                SetCursor(LoadCursorW(nullptr, IDC_SIZEALL));
+                return TRUE;
+            }
+        }
+        break;
+    }
 
     case WM_LBUTTONDBLCLK:
         ToggleFullscreen(hWnd);
