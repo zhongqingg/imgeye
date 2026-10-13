@@ -45,6 +45,7 @@ extern const Lexilla::LexerModule lmXML;
 #define IDC_TOOL_SQUARE 1013
 #define IDC_TOOL_CLEAR  1014
 #define IDC_TOOL_ELLIPSE 1015
+#define IDC_TOOL_LINE   1016
 #define IDR_FIT   101
 #define IDR_ROTL  102
 #define IDR_ROTR  103
@@ -138,14 +139,15 @@ static HBITMAP             g_hBtnPinBmpFixed = nullptr;  // fixed (sunken) icon
 // ROI parameter statistics (single-channel gray: HIG, TIFF/TIF)
 static bool g_statsMode = false;   // stats sidebar active for current image
 static bool g_isTiff    = false;   // current file is .tif/.tiff
-static int  g_tool      = 1;       // 0=none,1=circle,2=rect,3=square,4=ellipse
-static int  g_roiShape  = 0;       // shape shown: 0=none,1=circle,2=rect,3=square,4=ellipse
-static int  g_roiX0 = 0, g_roiY0 = 0, g_roiX1 = 0, g_roiY1 = 0; // image coords
+static int  g_tool      = 1;       // 0=none,1=circle,2=rect,3=square,4=ellipse,5=line
+static int  g_roiShape  = 0;       // shape shown: 0=none,1=circle,2=rect,3=square,4=ellipse,5=line
+static int  g_roiX0 = 0, g_roiY0 = 0, g_roiX1 = 0, g_roiY1 = 0; // image coords (line: endpoints)
 static int  g_roiMode = 0;      // 0=none, 1=create, 2=resize, 3=move
-static int  g_roiHandle = -1;   // active resize handle (0..7)
+static int  g_roiHandle = -1;   // active resize handle (0..7; line: 0=start,1=end)
 static int  g_roiDragIx = 0, g_roiDragIy = 0;                 // drag start (image coords)
 static int  g_roiOrigL = 0, g_roiOrigT = 0, g_roiOrigR = 0, g_roiOrigB = 0; // bbox at drag start
-static HWND g_hToolCircle = nullptr, g_hToolRect = nullptr, g_hToolSquare = nullptr, g_hToolClear = nullptr, g_hToolEllipse = nullptr;
+static int  g_roiOrigX0 = 0, g_roiOrigY0 = 0, g_roiOrigX1 = 0, g_roiOrigY1 = 0; // endpoints at drag start (line)
+static HWND g_hToolCircle = nullptr, g_hToolRect = nullptr, g_hToolSquare = nullptr, g_hToolClear = nullptr, g_hToolEllipse = nullptr, g_hToolLine = nullptr;
 static bool                g_winFixed = false;        // pin state
 static int                 g_fixedWinWidth = 0;       // fixed window width value
 
@@ -591,7 +593,7 @@ struct RoiStats {
 
 static RoiStats ComputeRoiStats() {
     RoiStats s;
-    if (!g_statsMode || g_roiShape == 0 || g_realGray.empty() || g_imgW == 0 || g_imgH == 0) return s;
+    if (!g_statsMode || g_roiShape == 0 || g_roiShape == 5 || g_realGray.empty() || g_imgW == 0 || g_imgH == 0) return s;
     int W = (int)g_imgW, H = (int)g_imgH;
     int x0 = g_roiX0 < g_roiX1 ? g_roiX0 : g_roiX1;
     int x1 = g_roiX0 < g_roiX1 ? g_roiX1 : g_roiX0;
@@ -669,8 +671,14 @@ static void SetRoiBBox(int l, int t, int r, int b) {
 }
 
 // Screen position of handle h (0=TL,1=T,2=TR,3=R,4=BR,5=B,6=BL,7=L).
+// For a line (shape 5): handle 0 = start point, handle 1 = end point.
 static bool HandleScreenPos(int h, int* sx, int* sy) {
     if (!g_statsMode || g_roiShape == 0) return false;
+    if (g_roiShape == 5) {
+        if (h == 0) { *sx = g_offsetX + (int)(g_roiX0 * g_zoom); *sy = g_offsetY + (int)(g_roiY0 * g_zoom); return true; }
+        if (h == 1) { *sx = g_offsetX + (int)(g_roiX1 * g_zoom); *sy = g_offsetY + (int)(g_roiY1 * g_zoom); return true; }
+        return false;
+    }
     int l, t, r, b; GetRoiBBox(&l, &t, &r, &b);
     int sl = g_offsetX + (int)(l * g_zoom), st = g_offsetY + (int)(t * g_zoom);
     int sr = g_offsetX + (int)(r * g_zoom), sb = g_offsetY + (int)(b * g_zoom);
@@ -689,9 +697,21 @@ static bool HandleScreenPos(int h, int* sx, int* sy) {
     return true;
 }
 
+// Distance from point (px,py) to segment (x0,y0)-(x1,y1), all in screen coords.
+static double DistToSegment(double px, double py, double x0, double y0, double x1, double y1) {
+    double dx = x1 - x0, dy = y1 - y0;
+    double len2 = dx * dx + dy * dy;
+    double t = (len2 > 0) ? ((px - x0) * dx + (py - y0) * dy) / len2 : 0.0;
+    if (t < 0) t = 0; if (t > 1) t = 1;
+    double cx = x0 + t * dx, cy = y0 + t * dy;
+    double ex = px - cx, ey = py - cy;
+    return sqrt(ex * ex + ey * ey);
+}
+
 static int HitTestHandle(int cx, int cy) {
-    for (int h = 0; h < 8; h++) {
-        if (KeepSquareShape(g_roiShape) && (h & 1)) continue; // square: corner handles only
+    int maxh = (g_roiShape == 5) ? 2 : 8;
+    for (int h = 0; h < maxh; h++) {
+        if (g_roiShape != 5 && KeepSquareShape(g_roiShape) && (h & 1)) continue; // square: corner handles only
         int sx, sy;
         if (!HandleScreenPos(h, &sx, &sy)) continue;
         if (cx >= sx - 4 && cx <= sx + 4 && cy >= sy - 4 && cy <= sy + 4) return h;
@@ -711,6 +731,11 @@ static HCURSOR HandleCursor(int h) {
 
 static bool InsideRoi(int cx, int cy) {
     if (!g_statsMode || g_roiShape == 0) return false;
+    if (g_roiShape == 5) { // line: near the segment
+        double x0 = g_offsetX + g_roiX0 * g_zoom, y0 = g_offsetY + g_roiY0 * g_zoom;
+        double x1 = g_offsetX + g_roiX1 * g_zoom, y1 = g_offsetY + g_roiY1 * g_zoom;
+        return DistToSegment(cx, cy, x0, y0, x1, y1) <= 6.0;
+    }
     int ix = (int)((cx - g_offsetX) / g_zoom), iy = (int)((cy - g_offsetY) / g_zoom);
     int l, t, r, b; GetRoiBBox(&l, &t, &r, &b);
     return ix >= l && ix <= r && iy >= t && iy <= b;
@@ -718,10 +743,17 @@ static bool InsideRoi(int cx, int cy) {
 
 static void CaptureRoiOrigin(int ix, int iy) {
     GetRoiBBox(&g_roiOrigL, &g_roiOrigT, &g_roiOrigR, &g_roiOrigB);
+    g_roiOrigX0 = g_roiX0; g_roiOrigY0 = g_roiY0;
+    g_roiOrigX1 = g_roiX1; g_roiOrigY1 = g_roiY1;
     g_roiDragIx = ix; g_roiDragIy = iy;
 }
 
 static void ResizeRoiFromHandle(int h, int ix, int iy) {
+    if (g_roiShape == 5) { // line: move the dragged endpoint
+        if (h == 0) { g_roiX0 = ix; g_roiY0 = iy; }
+        else if (h == 1) { g_roiX1 = ix; g_roiY1 = iy; }
+        return;
+    }
     int l = g_roiOrigL, t = g_roiOrigT, r = g_roiOrigR, b = g_roiOrigB;
     if (KeepSquareShape(g_roiShape)) { // square: anchor at the opposite corner, keep square
         int ax, ay;
@@ -753,7 +785,43 @@ static void ResizeRoiFromHandle(int h, int ix, int iy) {
 }
 
 static void MoveRoi(int dIx, int dIy) {
+    if (g_roiShape == 5) { // line: translate both endpoints
+        g_roiX0 = g_roiOrigX0 + dIx; g_roiY0 = g_roiOrigY0 + dIy;
+        g_roiX1 = g_roiOrigX1 + dIx; g_roiY1 = g_roiOrigY1 + dIy;
+        return;
+    }
     SetRoiBBox(g_roiOrigL + dIx, g_roiOrigT + dIy, g_roiOrigR + dIx, g_roiOrigB + dIy);
+}
+
+// Snap a line end to horizontal/vertical when within ~5 degrees.
+static void SnapLineEnd(int x0, int y0, int* px, int* py) {
+    int dx = *px - x0, dy = *py - y0;
+    int adx = dx < 0 ? -dx : dx, ady = dy < 0 ? -dy : dy;
+    const int kTan = 9; // ~ tan(5.1deg) * 100
+    if (ady * 100 <= adx * kTan) *py = y0;        // horizontal
+    else if (adx * 100 <= ady * kTan) *px = x0;   // vertical
+}
+
+// Sample gray values along the line ROI, ordered left-to-right (top-to-bottom
+// for a vertical line).
+static void ComputeLineProfile(std::vector<DWORD>& prof) {
+    prof.clear();
+    if (g_roiShape != 5 || g_realGray.empty() || g_imgW == 0 || g_imgH == 0) return;
+    int W = (int)g_imgW, H = (int)g_imgH;
+    int sx = g_roiX0, sy = g_roiY0, ex = g_roiX1, ey = g_roiY1;
+    if (sx > ex || (sx == ex && sy > ey)) { int t; t = sx; sx = ex; ex = t; t = sy; sy = ey; ey = t; }
+    int dx = ex - sx, dy = ey - sy;
+    int steps = (dx < 0 ? -dx : dx) > (dy < 0 ? -dy : dy) ? (dx < 0 ? -dx : dx) : (dy < 0 ? -dy : dy);
+    if (steps < 1) steps = 1;
+    const int kMaxSteps = 6000;
+    if (steps > kMaxSteps) steps = kMaxSteps;
+    prof.reserve(steps + 1);
+    for (int i = 0; i <= steps; i++) {
+        int x = sx + (int)((long long)dx * i / steps);
+        int y = sy + (int)((long long)dy * i / steps);
+        if (x < 0 || y < 0 || x >= W || y >= H) { prof.push_back(0); continue; }
+        prof.push_back(g_realGray[(size_t)y * W + x]);
+    }
 }
 
 // Compute the visible sub-region (in view coordinates) of a dw x dh image
@@ -792,7 +860,8 @@ static void LayoutStatsPane(HWND hWnd) {
     if (!g_statsMode) {
         ShowWindow(g_hToolCircle, SW_HIDE); ShowWindow(g_hToolEllipse, SW_HIDE);
         ShowWindow(g_hToolRect, SW_HIDE);
-        ShowWindow(g_hToolSquare, SW_HIDE); ShowWindow(g_hToolClear, SW_HIDE);
+        ShowWindow(g_hToolSquare, SW_HIDE); ShowWindow(g_hToolLine, SW_HIDE);
+        ShowWindow(g_hToolClear, SW_HIDE);
         return;
     }
     RECT sb; GetStatsBarRect(hWnd, &sb);
@@ -802,6 +871,7 @@ static void LayoutStatsPane(HWND hWnd) {
     ShowWindow(g_hToolEllipse, SW_SHOW); MoveWindow(g_hToolEllipse, sb.left + pad, y, bw, bh, TRUE); y += bh + gap;
     ShowWindow(g_hToolRect, SW_SHOW);    MoveWindow(g_hToolRect,    sb.left + pad, y, bw, bh, TRUE); y += bh + gap;
     ShowWindow(g_hToolSquare, SW_SHOW);  MoveWindow(g_hToolSquare,  sb.left + pad, y, bw, bh, TRUE); y += bh + gap;
+    ShowWindow(g_hToolLine, SW_SHOW);    MoveWindow(g_hToolLine,    sb.left + pad, y, bw, bh, TRUE); y += bh + gap;
     ShowWindow(g_hToolClear, SW_SHOW);   MoveWindow(g_hToolClear,   sb.left + pad, y, bw, bh, TRUE);
 }
 
@@ -1317,7 +1387,10 @@ static void Paint(HWND hWnd) {
         HPEN pen = CreatePen(PS_SOLID, 1, RGB(255, 70, 70));
         HPEN oldPen = (HPEN)SelectObject(hdcMem, pen);
         HBRUSH oldBr = (HBRUSH)SelectObject(hdcMem, GetStockObject(NULL_BRUSH));
-        if (EllipseShape(g_roiShape)) Ellipse(hdcMem, l, t, r, b);
+        if (g_roiShape == 5) { // line
+            MoveToEx(hdcMem, sx0, sy0, nullptr);
+            LineTo(hdcMem, sx1, sy1);
+        } else if (EllipseShape(g_roiShape)) Ellipse(hdcMem, l, t, r, b);
         else                 Rectangle(hdcMem, l, t, r, b);
         SelectObject(hdcMem, oldPen);
         SelectObject(hdcMem, oldBr);
@@ -1328,8 +1401,9 @@ static void Paint(HWND hWnd) {
         HPEN hpenHandle = CreatePen(PS_SOLID, 1, RGB(255, 70, 70));
         HBRUSH ob = (HBRUSH)SelectObject(hdcMem, hbrHandle);
         HPEN opn = (HPEN)SelectObject(hdcMem, hpenHandle);
-        for (int h = 0; h < 8; h++) {
-            if (KeepSquareShape(g_roiShape) && (h & 1)) continue; // square: corners only
+        int maxh = (g_roiShape == 5) ? 2 : 8;
+        for (int h = 0; h < maxh; h++) {
+            if (g_roiShape != 5 && KeepSquareShape(g_roiShape) && (h & 1)) continue; // square: corners only
             int hx, hy;
             if (!HandleScreenPos(h, &hx, &hy)) continue;
             RECT hr = { hx - 3, hy - 3, hx + 4, hy + 4 };
@@ -1361,28 +1435,79 @@ static void Paint(HWND hWnd) {
         int x = sb.left + 12, y = sb.top + 12, lh = 20;
         SetTextColor(hdcMem, RGB(240, 240, 240));
         TextOutW(hdcMem, x, y, L"参数统计", 4);
-        y = sb.top + 210; // below the tool buttons
 
-        RoiStats st = ComputeRoiStats();
-        wchar_t line[96];
-        if (!st.valid) {
-            SetTextColor(hdcMem, RGB(170, 170, 175));
-            const wchar_t* hints[] = { L"Shift+拖动：绘制图形", L"形状内拖动：移动图形", L"形状外拖动：平移图像" };
-            for (auto hp : hints) { TextOutW(hdcMem, x, y, hp, (int)wcslen(hp)); y += lh; }
-            y += 6;
+        if (g_roiShape == 5) {
+            // Line grayscale profile (left -> right)
+            std::vector<DWORD> prof;
+            ComputeLineProfile(prof);
+            if (prof.size() < 2) {
+                SetTextColor(hdcMem, RGB(170, 170, 175));
+                const wchar_t* tp = L"Shift+拖动：绘制直线";
+                TextOutW(hdcMem, x, sb.top + 242, tp, (int)wcslen(tp));
+            } else {
+                RECT plot = { sb.left + 12, sb.top + 242, sb.right - 12, sb.bottom - 16 };
+                if (plot.bottom > plot.top + 30 && plot.right > plot.left + 20) {
+                    HBRUSH pb = CreateSolidBrush(RGB(28, 28, 30));
+                    FillRect(hdcMem, &plot, pb);
+                    DeleteObject(pb);
+                    int pw = plot.right - plot.left, ph = plot.bottom - plot.top;
+                    double maxv = g_realMax > 0 ? (double)g_realMax : 1.0;
+                    // mid gridline
+                    HPEN gp = CreatePen(PS_SOLID, 1, RGB(70, 70, 75));
+                    HPEN ogp = (HPEN)SelectObject(hdcMem, gp);
+                    MoveToEx(hdcMem, plot.left, plot.top + ph / 2, nullptr);
+                    LineTo(hdcMem, plot.right, plot.top + ph / 2);
+                    SelectObject(hdcMem, ogp);
+                    DeleteObject(gp);
+                    // curve (downsample to plot width)
+                    std::vector<POINT> pts;
+                    pts.reserve(pw);
+                    size_t n = prof.size();
+                    for (int i = 0; i < pw; i++) {
+                        size_t idx = (size_t)((double)i * (n - 1) / (pw > 1 ? pw - 1 : 1));
+                        double v = (double)prof[idx];
+                        if (v > maxv) v = maxv;
+                        int py = plot.bottom - (int)(v * ph / maxv);
+                        if (py < plot.top) py = plot.top;
+                        POINT pt = { plot.left + i, py };
+                        pts.push_back(pt);
+                    }
+                    HPEN cp = CreatePen(PS_SOLID, 1, RGB(120, 230, 120));
+                    HPEN ocp = (HPEN)SelectObject(hdcMem, cp);
+                    Polyline(hdcMem, pts.data(), (int)pts.size());
+                    SelectObject(hdcMem, ocp);
+                    DeleteObject(cp);
+                    // axis labels
+                    SetTextColor(hdcMem, RGB(150, 150, 155));
+                    wchar_t lb[32];
+                    swprintf_s(lb, L"%d", (int)maxv);
+                    TextOutW(hdcMem, plot.left + 2, plot.top + 1, lb, (int)wcslen(lb));
+                    TextOutW(hdcMem, plot.left + 2, plot.bottom - 15, L"0", 1);
+                }
+            }
         } else {
-            SetTextColor(hdcMem, RGB(180, 180, 185));
-            swprintf_s(line, L"像素数: %lld", st.count);
-            TextOutW(hdcMem, x, y, line, (int)wcslen(line)); y += lh + 6;
-            SetTextColor(hdcMem, RGB(240, 240, 240));
-            #define STATLINE(label, val) do { swprintf_s(line, L##label L": %.4g", (val)); TextOutW(hdcMem, x, y, line, (int)wcslen(line)); y += lh; } while(0)
-            STATLINE("最大值", st.maxv);
-            STATLINE("最小值", st.minv);
-            STATLINE("均值",   st.mean);
-            STATLINE("RMS",    st.rms);
-            STATLINE("调制度", st.mod);
-            STATLINE("对比度", st.contrast);
-            #undef STATLINE
+            y = sb.top + 242; // below the tool buttons
+            RoiStats st = ComputeRoiStats();
+            wchar_t line[96];
+            if (!st.valid) {
+                SetTextColor(hdcMem, RGB(170, 170, 175));
+                const wchar_t* hints[] = { L"Shift+拖动：绘制图形", L"形状内拖动：移动图形", L"形状外拖动：平移图像" };
+                for (auto hp : hints) { TextOutW(hdcMem, x, y, hp, (int)wcslen(hp)); y += lh; }
+                y += 6;
+            } else {
+                SetTextColor(hdcMem, RGB(180, 180, 185));
+                swprintf_s(line, L"像素数: %lld", st.count);
+                TextOutW(hdcMem, x, y, line, (int)wcslen(line)); y += lh + 6;
+                SetTextColor(hdcMem, RGB(240, 240, 240));
+                #define STATLINE(label, val) do { swprintf_s(line, L##label L": %.4g", (val)); TextOutW(hdcMem, x, y, line, (int)wcslen(line)); y += lh; } while(0)
+                STATLINE("最大值", st.maxv);
+                STATLINE("最小值", st.minv);
+                STATLINE("均值",   st.mean);
+                STATLINE("RMS",    st.rms);
+                STATLINE("调制度", st.mod);
+                STATLINE("对比度", st.contrast);
+                #undef STATLINE
+            }
         }
         SelectObject(hdcMem, oldFont);
     }
@@ -2376,6 +2501,8 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int nCmdShow) {
         WS_CHILD | BS_AUTORADIOBUTTON, 0, 0, 0, 0, g_hWnd, (HMENU)IDC_TOOL_RECT, hInstance, nullptr);
     g_hToolSquare = CreateWindowExW(0, L"BUTTON", L"正方形",
         WS_CHILD | BS_AUTORADIOBUTTON, 0, 0, 0, 0, g_hWnd, (HMENU)IDC_TOOL_SQUARE, hInstance, nullptr);
+    g_hToolLine = CreateWindowExW(0, L"BUTTON", L"线灰度",
+        WS_CHILD | BS_AUTORADIOBUTTON, 0, 0, 0, 0, g_hWnd, (HMENU)IDC_TOOL_LINE, hInstance, nullptr);
     g_hToolClear = CreateWindowExW(0, L"BUTTON", L"清除形状",
         WS_CHILD | BS_AUTORADIOBUTTON, 0, 0, 0, 0, g_hWnd, (HMENU)IDC_TOOL_CLEAR, hInstance, nullptr);
     SendMessageW(g_hToolCircle, BM_SETCHECK, BST_CHECKED, 0);
@@ -2385,6 +2512,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int nCmdShow) {
         SendMessageW(g_hToolEllipse, WM_SETFONT, (WPARAM)hf, TRUE);
         SendMessageW(g_hToolRect, WM_SETFONT, (WPARAM)hf, TRUE);
         SendMessageW(g_hToolSquare, WM_SETFONT, (WPARAM)hf, TRUE);
+        SendMessageW(g_hToolLine, WM_SETFONT, (WPARAM)hf, TRUE);
         SendMessageW(g_hToolClear, WM_SETFONT, (WPARAM)hf, TRUE);
     }
 
@@ -2563,6 +2691,8 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 int s = (dx < 0 ? -dx : dx) > (dy < 0 ? -dy : dy) ? (dx < 0 ? -dx : dx) : (dy < 0 ? -dy : dy);
                 ix = g_roiX0 + (dx < 0 ? -s : s);
                 iy = g_roiY0 + (dy < 0 ? -s : s);
+            } else if (g_roiShape == 5) { // line: snap near-horizontal/vertical
+                SnapLineEnd(g_roiX0, g_roiY0, &ix, &iy);
             }
             g_roiX1 = ix;
             g_roiY1 = iy;
@@ -2691,6 +2821,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         case IDC_TOOL_ELLIPSE: g_tool = 4; InvalidateRect(hWnd, nullptr, FALSE); return 0;
         case IDC_TOOL_RECT:    g_tool = 2; InvalidateRect(hWnd, nullptr, FALSE); return 0;
         case IDC_TOOL_SQUARE:  g_tool = 3; InvalidateRect(hWnd, nullptr, FALSE); return 0;
+        case IDC_TOOL_LINE:    g_tool = 5; InvalidateRect(hWnd, nullptr, FALSE); return 0;
         case IDC_TOOL_CLEAR:   g_tool = 0; ResetRoi(); InvalidateRect(hWnd, nullptr, FALSE); return 0;
         case IDM_COPY_RGB:
             if (g_ctxValid) {
