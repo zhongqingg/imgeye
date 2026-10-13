@@ -44,6 +44,7 @@ extern const Lexilla::LexerModule lmXML;
 #define IDC_TOOL_RECT   1012
 #define IDC_TOOL_SQUARE 1013
 #define IDC_TOOL_CLEAR  1014
+#define IDC_TOOL_ELLIPSE 1015
 #define IDR_FIT   101
 #define IDR_ROTL  102
 #define IDR_ROTR  103
@@ -137,14 +138,14 @@ static HBITMAP             g_hBtnPinBmpFixed = nullptr;  // fixed (sunken) icon
 // ROI parameter statistics (single-channel gray: HIG, TIFF/TIF)
 static bool g_statsMode = false;   // stats sidebar active for current image
 static bool g_isTiff    = false;   // current file is .tif/.tiff
-static int  g_tool      = 1;       // 1=circle, 2=rect, 3=square, 0=none(clear)
-static int  g_roiShape  = 0;       // shape shown: 0=none,1=circle,2=rect,3=square
+static int  g_tool      = 1;       // 0=none,1=circle,2=rect,3=square,4=ellipse
+static int  g_roiShape  = 0;       // shape shown: 0=none,1=circle,2=rect,3=square,4=ellipse
 static int  g_roiX0 = 0, g_roiY0 = 0, g_roiX1 = 0, g_roiY1 = 0; // image coords
 static int  g_roiMode = 0;      // 0=none, 1=create, 2=resize, 3=move
 static int  g_roiHandle = -1;   // active resize handle (0..7)
 static int  g_roiDragIx = 0, g_roiDragIy = 0;                 // drag start (image coords)
 static int  g_roiOrigL = 0, g_roiOrigT = 0, g_roiOrigR = 0, g_roiOrigB = 0; // bbox at drag start
-static HWND g_hToolCircle = nullptr, g_hToolRect = nullptr, g_hToolSquare = nullptr, g_hToolClear = nullptr;
+static HWND g_hToolCircle = nullptr, g_hToolRect = nullptr, g_hToolSquare = nullptr, g_hToolClear = nullptr, g_hToolEllipse = nullptr;
 static bool                g_winFixed = false;        // pin state
 static int                 g_fixedWinWidth = 0;       // fixed window width value
 
@@ -218,6 +219,8 @@ static void      GetImageArea(HWND hWnd, RECT* rc);
 static void      LayoutSvgPane(HWND hWnd);
 static void      LayoutStatsPane(HWND hWnd);
 static void      ResetRoi();
+static bool      KeepSquareShape(int s);
+static bool      EllipseShape(int s);
 static void      MaterializeStaticSource();
 static void      RotateImage(HWND hWnd, bool clockwise);
 static bool      SaveImageFile(const wchar_t* path);
@@ -601,7 +604,7 @@ static RoiStats ComputeRoiStats() {
     double sum = 0, sumsq = 0;
     DWORD mn = 0xFFFFFFFFu, mx = 0;
     long long cnt = 0;
-    if (g_roiShape == 1) { // ellipse inscribed in the bounding box
+    if (EllipseShape(g_roiShape)) { // ellipse inscribed in the bounding box
         double cx = (x0 + x1) / 2.0, cy = (y0 + y1) / 2.0;
         double rx = (x1 - x0) / 2.0 + 0.5, ry = (y1 - y0) / 2.0 + 0.5;
         for (int y = y0; y <= y1; y++) {
@@ -647,6 +650,11 @@ static void ResetRoi() {
 
 // --- ROI geometry helpers (resize handles / move) ---
 
+// Circle/square keep a square bounding box (equal sides).
+static bool KeepSquareShape(int s) { return s == 1 || s == 3; }
+// Shapes drawn as an ellipse (circle, ellipse); others as a rectangle.
+static bool EllipseShape(int s) { return s == 1 || s == 4; }
+
 static void GetRoiBBox(int* l, int* t, int* r, int* b) {
     *l = g_roiX0 < g_roiX1 ? g_roiX0 : g_roiX1;
     *r = g_roiX0 < g_roiX1 ? g_roiX1 : g_roiX0;
@@ -683,7 +691,7 @@ static bool HandleScreenPos(int h, int* sx, int* sy) {
 
 static int HitTestHandle(int cx, int cy) {
     for (int h = 0; h < 8; h++) {
-        if (g_roiShape == 3 && (h & 1)) continue; // square: corner handles only
+        if (KeepSquareShape(g_roiShape) && (h & 1)) continue; // square: corner handles only
         int sx, sy;
         if (!HandleScreenPos(h, &sx, &sy)) continue;
         if (cx >= sx - 4 && cx <= sx + 4 && cy >= sy - 4 && cy <= sy + 4) return h;
@@ -715,7 +723,7 @@ static void CaptureRoiOrigin(int ix, int iy) {
 
 static void ResizeRoiFromHandle(int h, int ix, int iy) {
     int l = g_roiOrigL, t = g_roiOrigT, r = g_roiOrigR, b = g_roiOrigB;
-    if (g_roiShape == 3) { // square: anchor at the opposite corner, keep square
+    if (KeepSquareShape(g_roiShape)) { // square: anchor at the opposite corner, keep square
         int ax, ay;
         switch (h) {
         case 0: ax = r; ay = b; break;
@@ -782,17 +790,19 @@ static void LayoutSvgPane(HWND hWnd) {
 static void LayoutStatsPane(HWND hWnd) {
     if (!g_hToolCircle) return;
     if (!g_statsMode) {
-        ShowWindow(g_hToolCircle, SW_HIDE); ShowWindow(g_hToolRect, SW_HIDE);
+        ShowWindow(g_hToolCircle, SW_HIDE); ShowWindow(g_hToolEllipse, SW_HIDE);
+        ShowWindow(g_hToolRect, SW_HIDE);
         ShowWindow(g_hToolSquare, SW_HIDE); ShowWindow(g_hToolClear, SW_HIDE);
         return;
     }
     RECT sb; GetStatsBarRect(hWnd, &sb);
     int pad = 12, bw = sb.right - sb.left - pad * 2, bh = 26, gap = 6;
     int y = sb.top + 40; // below the title
-    ShowWindow(g_hToolCircle, SW_SHOW); MoveWindow(g_hToolCircle, sb.left + pad, y, bw, bh, TRUE); y += bh + gap;
-    ShowWindow(g_hToolRect, SW_SHOW);   MoveWindow(g_hToolRect,   sb.left + pad, y, bw, bh, TRUE); y += bh + gap;
-    ShowWindow(g_hToolSquare, SW_SHOW); MoveWindow(g_hToolSquare, sb.left + pad, y, bw, bh, TRUE); y += bh + gap;
-    ShowWindow(g_hToolClear, SW_SHOW);  MoveWindow(g_hToolClear,  sb.left + pad, y, bw, bh, TRUE);
+    ShowWindow(g_hToolCircle, SW_SHOW);  MoveWindow(g_hToolCircle,  sb.left + pad, y, bw, bh, TRUE); y += bh + gap;
+    ShowWindow(g_hToolEllipse, SW_SHOW); MoveWindow(g_hToolEllipse, sb.left + pad, y, bw, bh, TRUE); y += bh + gap;
+    ShowWindow(g_hToolRect, SW_SHOW);    MoveWindow(g_hToolRect,    sb.left + pad, y, bw, bh, TRUE); y += bh + gap;
+    ShowWindow(g_hToolSquare, SW_SHOW);  MoveWindow(g_hToolSquare,  sb.left + pad, y, bw, bh, TRUE); y += bh + gap;
+    ShowWindow(g_hToolClear, SW_SHOW);   MoveWindow(g_hToolClear,   sb.left + pad, y, bw, bh, TRUE);
 }
 
 static void LoadSvgIntoEdit(const wchar_t* path) {
@@ -1307,7 +1317,7 @@ static void Paint(HWND hWnd) {
         HPEN pen = CreatePen(PS_SOLID, 1, RGB(255, 70, 70));
         HPEN oldPen = (HPEN)SelectObject(hdcMem, pen);
         HBRUSH oldBr = (HBRUSH)SelectObject(hdcMem, GetStockObject(NULL_BRUSH));
-        if (g_roiShape == 1) Ellipse(hdcMem, l, t, r, b);
+        if (EllipseShape(g_roiShape)) Ellipse(hdcMem, l, t, r, b);
         else                 Rectangle(hdcMem, l, t, r, b);
         SelectObject(hdcMem, oldPen);
         SelectObject(hdcMem, oldBr);
@@ -1319,7 +1329,7 @@ static void Paint(HWND hWnd) {
         HBRUSH ob = (HBRUSH)SelectObject(hdcMem, hbrHandle);
         HPEN opn = (HPEN)SelectObject(hdcMem, hpenHandle);
         for (int h = 0; h < 8; h++) {
-            if (g_roiShape == 3 && (h & 1)) continue; // square: corners only
+            if (KeepSquareShape(g_roiShape) && (h & 1)) continue; // square: corners only
             int hx, hy;
             if (!HandleScreenPos(h, &hx, &hy)) continue;
             RECT hr = { hx - 3, hy - 3, hx + 4, hy + 4 };
@@ -1351,7 +1361,7 @@ static void Paint(HWND hWnd) {
         int x = sb.left + 12, y = sb.top + 12, lh = 20;
         SetTextColor(hdcMem, RGB(240, 240, 240));
         TextOutW(hdcMem, x, y, L"参数统计", 4);
-        y = sb.top + 176; // below the tool buttons
+        y = sb.top + 210; // below the tool buttons
 
         RoiStats st = ComputeRoiStats();
         wchar_t line[96];
@@ -2358,6 +2368,8 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int nCmdShow) {
     // ROI parameter-statistics sidebar tool buttons (auto-radio group), hidden by default
     g_hToolCircle = CreateWindowExW(0, L"BUTTON", L"圆形",
         WS_CHILD | BS_AUTORADIOBUTTON | WS_GROUP, 0, 0, 0, 0, g_hWnd, (HMENU)IDC_TOOL_CIRCLE, hInstance, nullptr);
+    g_hToolEllipse = CreateWindowExW(0, L"BUTTON", L"椭圆",
+        WS_CHILD | BS_AUTORADIOBUTTON, 0, 0, 0, 0, g_hWnd, (HMENU)IDC_TOOL_ELLIPSE, hInstance, nullptr);
     g_hToolRect = CreateWindowExW(0, L"BUTTON", L"矩形",
         WS_CHILD | BS_AUTORADIOBUTTON, 0, 0, 0, 0, g_hWnd, (HMENU)IDC_TOOL_RECT, hInstance, nullptr);
     g_hToolSquare = CreateWindowExW(0, L"BUTTON", L"正方形",
@@ -2368,6 +2380,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int nCmdShow) {
     if (g_hToolCircle) {
         HFONT hf = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
         SendMessageW(g_hToolCircle, WM_SETFONT, (WPARAM)hf, TRUE);
+        SendMessageW(g_hToolEllipse, WM_SETFONT, (WPARAM)hf, TRUE);
         SendMessageW(g_hToolRect, WM_SETFONT, (WPARAM)hf, TRUE);
         SendMessageW(g_hToolSquare, WM_SETFONT, (WPARAM)hf, TRUE);
         SendMessageW(g_hToolClear, WM_SETFONT, (WPARAM)hf, TRUE);
@@ -2543,7 +2556,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         if (g_roiMode == 1) {
             int ix = (int)((mx - g_offsetX) / g_zoom);
             int iy = (int)((my - g_offsetY) / g_zoom);
-            if (g_roiShape == 3) { // square: constrain to a square
+            if (KeepSquareShape(g_roiShape)) { // square: constrain to a square
                 int dx = ix - g_roiX0, dy = iy - g_roiY0;
                 int s = (dx < 0 ? -dx : dx) > (dy < 0 ? -dy : dy) ? (dx < 0 ? -dx : dx) : (dy < 0 ? -dy : dy);
                 ix = g_roiX0 + (dx < 0 ? -s : s);
@@ -2672,10 +2685,11 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             if (g_winFixed) g_fixedWinWidth = g_higWinWidth; // capture current value
             if (g_hBtnPin) InvalidateRect(g_hBtnPin, nullptr, TRUE);
             return 0;
-        case IDC_TOOL_CIRCLE: g_tool = 1; InvalidateRect(hWnd, nullptr, FALSE); return 0;
-        case IDC_TOOL_RECT:   g_tool = 2; InvalidateRect(hWnd, nullptr, FALSE); return 0;
-        case IDC_TOOL_SQUARE: g_tool = 3; InvalidateRect(hWnd, nullptr, FALSE); return 0;
-        case IDC_TOOL_CLEAR:  g_tool = 0; ResetRoi(); InvalidateRect(hWnd, nullptr, FALSE); return 0;
+        case IDC_TOOL_CIRCLE:  g_tool = 1; InvalidateRect(hWnd, nullptr, FALSE); return 0;
+        case IDC_TOOL_ELLIPSE: g_tool = 4; InvalidateRect(hWnd, nullptr, FALSE); return 0;
+        case IDC_TOOL_RECT:    g_tool = 2; InvalidateRect(hWnd, nullptr, FALSE); return 0;
+        case IDC_TOOL_SQUARE:  g_tool = 3; InvalidateRect(hWnd, nullptr, FALSE); return 0;
+        case IDC_TOOL_CLEAR:   g_tool = 0; ResetRoi(); InvalidateRect(hWnd, nullptr, FALSE); return 0;
         case IDM_COPY_RGB:
             if (g_ctxValid) {
                 wchar_t buf[32];
