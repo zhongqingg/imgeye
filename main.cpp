@@ -1947,7 +1947,9 @@ static void CaptureRealGray() {
     size_t n = (size_t)g_imgW * g_imgH;
     g_realGray.resize(n);
     if (bits == 8) {
-        if (FAILED(g_pFrame->CopyPixels(nullptr, g_imgW, (UINT)n, (BYTE*)g_realGray.data()))) { g_realGray.clear(); return; }
+        std::vector<BYTE> tmp(n);
+        if (FAILED(g_pFrame->CopyPixels(nullptr, g_imgW, (UINT)n, tmp.data()))) { g_realGray.clear(); return; }
+        for (size_t i = 0; i < n; i++) g_realGray[i] = tmp[i];
     } else {
         std::vector<BYTE> tmp(n * 2);
         if (FAILED(g_pFrame->CopyPixels(nullptr, g_imgW * 2, (UINT)(n * 2), tmp.data()))) { g_realGray.clear(); return; }
