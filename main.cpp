@@ -40,10 +40,10 @@ extern const Lexilla::LexerModule lmXML;
 #define IDC_BTN_ROTR 1008
 #define IDC_HIG_TRACK 1009
 #define IDC_BTN_PIN  1010
-#define IDC_TOOL_PAN    1011
-#define IDC_TOOL_CIRCLE 1012
-#define IDC_TOOL_RECT   1013
-#define IDC_TOOL_SQUARE 1014
+#define IDC_TOOL_CIRCLE 1011
+#define IDC_TOOL_RECT   1012
+#define IDC_TOOL_SQUARE 1013
+#define IDC_TOOL_CLEAR  1014
 #define IDR_FIT   101
 #define IDR_ROTL  102
 #define IDR_ROTR  103
@@ -137,14 +137,14 @@ static HBITMAP             g_hBtnPinBmpFixed = nullptr;  // fixed (sunken) icon
 // ROI parameter statistics (single-channel gray: HIG, TIFF/TIF)
 static bool g_statsMode = false;   // stats sidebar active for current image
 static bool g_isTiff    = false;   // current file is .tif/.tiff
-static int  g_tool      = 0;       // 0=pan, 1=circle, 2=rect, 3=square
+static int  g_tool      = 1;       // 1=circle, 2=rect, 3=square, 0=none(clear)
 static int  g_roiShape  = 0;       // shape shown: 0=none,1=circle,2=rect,3=square
 static int  g_roiX0 = 0, g_roiY0 = 0, g_roiX1 = 0, g_roiY1 = 0; // image coords
 static int  g_roiMode = 0;      // 0=none, 1=create, 2=resize, 3=move
 static int  g_roiHandle = -1;   // active resize handle (0..7)
 static int  g_roiDragIx = 0, g_roiDragIy = 0;                 // drag start (image coords)
 static int  g_roiOrigL = 0, g_roiOrigT = 0, g_roiOrigR = 0, g_roiOrigB = 0; // bbox at drag start
-static HWND g_hToolPan = nullptr, g_hToolCircle = nullptr, g_hToolRect = nullptr, g_hToolSquare = nullptr;
+static HWND g_hToolCircle = nullptr, g_hToolRect = nullptr, g_hToolSquare = nullptr, g_hToolClear = nullptr;
 static bool                g_winFixed = false;        // pin state
 static int                 g_fixedWinWidth = 0;       // fixed window width value
 
@@ -780,20 +780,19 @@ static void LayoutSvgPane(HWND hWnd) {
 }
 
 static void LayoutStatsPane(HWND hWnd) {
-    if (!g_hToolPan) return;
-    int show = g_statsMode ? SW_SHOW : SW_HIDE;
+    if (!g_hToolCircle) return;
     if (!g_statsMode) {
-        ShowWindow(g_hToolPan, show); ShowWindow(g_hToolCircle, show);
-        ShowWindow(g_hToolRect, show); ShowWindow(g_hToolSquare, show);
+        ShowWindow(g_hToolCircle, SW_HIDE); ShowWindow(g_hToolRect, SW_HIDE);
+        ShowWindow(g_hToolSquare, SW_HIDE); ShowWindow(g_hToolClear, SW_HIDE);
         return;
     }
     RECT sb; GetStatsBarRect(hWnd, &sb);
     int pad = 12, bw = sb.right - sb.left - pad * 2, bh = 26, gap = 6;
     int y = sb.top + 40; // below the title
-    ShowWindow(g_hToolPan, SW_SHOW);    MoveWindow(g_hToolPan,    sb.left + pad, y, bw, bh, TRUE); y += bh + gap;
     ShowWindow(g_hToolCircle, SW_SHOW); MoveWindow(g_hToolCircle, sb.left + pad, y, bw, bh, TRUE); y += bh + gap;
     ShowWindow(g_hToolRect, SW_SHOW);   MoveWindow(g_hToolRect,   sb.left + pad, y, bw, bh, TRUE); y += bh + gap;
-    ShowWindow(g_hToolSquare, SW_SHOW); MoveWindow(g_hToolSquare, sb.left + pad, y, bw, bh, TRUE);
+    ShowWindow(g_hToolSquare, SW_SHOW); MoveWindow(g_hToolSquare, sb.left + pad, y, bw, bh, TRUE); y += bh + gap;
+    ShowWindow(g_hToolClear, SW_SHOW);  MoveWindow(g_hToolClear,  sb.left + pad, y, bw, bh, TRUE);
 }
 
 static void LoadSvgIntoEdit(const wchar_t* path) {
@@ -1358,8 +1357,9 @@ static void Paint(HWND hWnd) {
         wchar_t line[96];
         if (!st.valid) {
             SetTextColor(hdcMem, RGB(170, 170, 175));
-            TextOutW(hdcMem, x, y, L"选择工具后在图像上", 9); y += lh;
-            TextOutW(hdcMem, x, y, L"拖动绘制区域", 6); y += lh + 6;
+            const wchar_t* hints[] = { L"Shift+拖动：绘制图形", L"形状内拖动：移动图形", L"形状外拖动：平移图像" };
+            for (auto hp : hints) { TextOutW(hdcMem, x, y, hp, (int)wcslen(hp)); y += lh; }
+            y += 6;
         } else {
             SetTextColor(hdcMem, RGB(180, 180, 185));
             swprintf_s(line, L"像素数: %lld", st.count);
@@ -2356,21 +2356,21 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int nCmdShow) {
     }
 
     // ROI parameter-statistics sidebar tool buttons (auto-radio group), hidden by default
-    g_hToolPan = CreateWindowExW(0, L"BUTTON", L"平移",
-        WS_CHILD | BS_AUTORADIOBUTTON | WS_GROUP, 0, 0, 0, 0, g_hWnd, (HMENU)IDC_TOOL_PAN, hInstance, nullptr);
     g_hToolCircle = CreateWindowExW(0, L"BUTTON", L"圆形",
-        WS_CHILD | BS_AUTORADIOBUTTON, 0, 0, 0, 0, g_hWnd, (HMENU)IDC_TOOL_CIRCLE, hInstance, nullptr);
+        WS_CHILD | BS_AUTORADIOBUTTON | WS_GROUP, 0, 0, 0, 0, g_hWnd, (HMENU)IDC_TOOL_CIRCLE, hInstance, nullptr);
     g_hToolRect = CreateWindowExW(0, L"BUTTON", L"矩形",
         WS_CHILD | BS_AUTORADIOBUTTON, 0, 0, 0, 0, g_hWnd, (HMENU)IDC_TOOL_RECT, hInstance, nullptr);
     g_hToolSquare = CreateWindowExW(0, L"BUTTON", L"正方形",
         WS_CHILD | BS_AUTORADIOBUTTON, 0, 0, 0, 0, g_hWnd, (HMENU)IDC_TOOL_SQUARE, hInstance, nullptr);
-    SendMessageW(g_hToolPan, BM_SETCHECK, BST_CHECKED, 0);
-    if (g_hToolPan) {
+    g_hToolClear = CreateWindowExW(0, L"BUTTON", L"清除形状",
+        WS_CHILD | BS_AUTORADIOBUTTON, 0, 0, 0, 0, g_hWnd, (HMENU)IDC_TOOL_CLEAR, hInstance, nullptr);
+    SendMessageW(g_hToolCircle, BM_SETCHECK, BST_CHECKED, 0);
+    if (g_hToolCircle) {
         HFONT hf = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
-        SendMessageW(g_hToolPan, WM_SETFONT, (WPARAM)hf, TRUE);
         SendMessageW(g_hToolCircle, WM_SETFONT, (WPARAM)hf, TRUE);
         SendMessageW(g_hToolRect, WM_SETFONT, (WPARAM)hf, TRUE);
         SendMessageW(g_hToolSquare, WM_SETFONT, (WPARAM)hf, TRUE);
+        SendMessageW(g_hToolClear, WM_SETFONT, (WPARAM)hf, TRUE);
     }
 
     CenterWindow(g_hWnd);
@@ -2497,33 +2497,36 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     case WM_LBUTTONDOWN: {
         SetFocus(hWnd); // blur the SVG edit pane so arrow keys browse images
         int cx = GET_X_LPARAM(lParam), cy = GET_Y_LPARAM(lParam);
-        if (g_statsMode && g_roiShape != 0) {
-            int h = HitTestHandle(cx, cy);
-            bool shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
-            if (h >= 0) { // resize via a handle
-                CaptureRoiOrigin((int)((cx - g_offsetX) / g_zoom), (int)((cy - g_offsetY) / g_zoom));
-                g_roiMode = 2; g_roiHandle = h;
+        bool shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
+        if (g_statsMode) {
+            if (shift && g_tool != 0) {
+                // Shift + drag: draw a new shape
+                int ix = (int)((cx - g_offsetX) / g_zoom);
+                int iy = (int)((cy - g_offsetY) / g_zoom);
+                g_roiShape = g_tool;
+                g_roiX0 = g_roiX1 = ix;
+                g_roiY0 = g_roiY1 = iy;
+                g_roiMode = 1;
                 SetCapture(hWnd);
+                InvalidateRect(hWnd, nullptr, FALSE);
                 return 0;
             }
-            if (shift && InsideRoi(cx, cy)) { // move the shape
-                CaptureRoiOrigin((int)((cx - g_offsetX) / g_zoom), (int)((cy - g_offsetY) / g_zoom));
-                g_roiMode = 3;
-                SetCapture(hWnd);
-                return 0;
+            if (!shift && g_roiShape != 0) {
+                int h = HitTestHandle(cx, cy);
+                if (h >= 0) { // resize via a handle
+                    CaptureRoiOrigin((int)((cx - g_offsetX) / g_zoom), (int)((cy - g_offsetY) / g_zoom));
+                    g_roiMode = 2; g_roiHandle = h;
+                    SetCapture(hWnd);
+                    return 0;
+                }
+                if (InsideRoi(cx, cy)) { // move the shape
+                    CaptureRoiOrigin((int)((cx - g_offsetX) / g_zoom), (int)((cy - g_offsetY) / g_zoom));
+                    g_roiMode = 3;
+                    SetCapture(hWnd);
+                    return 0;
+                }
             }
-        }
-        if (g_statsMode && g_tool != 0) {
-            // Start drawing a new ROI
-            int ix = (int)((cx - g_offsetX) / g_zoom);
-            int iy = (int)((cy - g_offsetY) / g_zoom);
-            g_roiShape = g_tool;
-            g_roiX0 = g_roiX1 = ix;
-            g_roiY0 = g_roiY1 = iy;
-            g_roiMode = 1;
-            SetCapture(hWnd);
-            InvalidateRect(hWnd, nullptr, FALSE);
-            return 0;
+            // otherwise fall through to pan the image (shape moves with it)
         }
         SetCapture(hWnd);
         g_dragging = true;
@@ -2571,13 +2574,16 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         return 0;
 
     case WM_SETCURSOR: {
-        if (LOWORD(lParam) == HTCLIENT && g_statsMode && g_roiShape != 0 && g_roiMode == 0) {
+        if (LOWORD(lParam) == HTCLIENT && g_statsMode && g_roiMode == 0) {
             POINT p; GetCursorPos(&p); ScreenToClient(hWnd, &p);
-            int h = HitTestHandle(p.x, p.y);
-            if (h >= 0) { SetCursor(HandleCursor(h)); return TRUE; }
-            if ((GetKeyState(VK_SHIFT) & 0x8000) && InsideRoi(p.x, p.y)) {
-                SetCursor(LoadCursorW(nullptr, IDC_SIZEALL));
+            if ((GetKeyState(VK_SHIFT) & 0x8000) && g_tool != 0) {
+                SetCursor(LoadCursorW(nullptr, IDC_CROSS)); // Shift = draw
                 return TRUE;
+            }
+            if (g_roiShape != 0) {
+                int h = HitTestHandle(p.x, p.y);
+                if (h >= 0) { SetCursor(HandleCursor(h)); return TRUE; }
+                if (InsideRoi(p.x, p.y)) { SetCursor(LoadCursorW(nullptr, IDC_SIZEALL)); return TRUE; }
             }
         }
         break;
@@ -2666,10 +2672,10 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             if (g_winFixed) g_fixedWinWidth = g_higWinWidth; // capture current value
             if (g_hBtnPin) InvalidateRect(g_hBtnPin, nullptr, TRUE);
             return 0;
-        case IDC_TOOL_PAN:    g_tool = 0; ResetRoi(); InvalidateRect(hWnd, nullptr, FALSE); return 0;
-        case IDC_TOOL_CIRCLE: g_tool = 1; ResetRoi(); InvalidateRect(hWnd, nullptr, FALSE); return 0;
-        case IDC_TOOL_RECT:   g_tool = 2; ResetRoi(); InvalidateRect(hWnd, nullptr, FALSE); return 0;
-        case IDC_TOOL_SQUARE: g_tool = 3; ResetRoi(); InvalidateRect(hWnd, nullptr, FALSE); return 0;
+        case IDC_TOOL_CIRCLE: g_tool = 1; InvalidateRect(hWnd, nullptr, FALSE); return 0;
+        case IDC_TOOL_RECT:   g_tool = 2; InvalidateRect(hWnd, nullptr, FALSE); return 0;
+        case IDC_TOOL_SQUARE: g_tool = 3; InvalidateRect(hWnd, nullptr, FALSE); return 0;
+        case IDC_TOOL_CLEAR:  g_tool = 0; ResetRoi(); InvalidateRect(hWnd, nullptr, FALSE); return 0;
         case IDM_COPY_RGB:
             if (g_ctxValid) {
                 wchar_t buf[32];
