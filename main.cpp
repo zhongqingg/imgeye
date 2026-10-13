@@ -51,6 +51,11 @@ extern const Lexilla::LexerModule lmXML;
 #define IDR_ROTR  103
 #define IDR_PIN_FIXED   104
 #define IDR_PIN_UNFIXED 105
+#define IDR_FIT_RAW        201
+#define IDR_ROTL_RAW       202
+#define IDR_ROTR_RAW       203
+#define IDR_PIN_FIXED_RAW  204
+#define IDR_PIN_UNFIXED_RAW 205
 #define IDM_COPY_RGB 2001
 #define IDM_COPY_HEX 2002
 #define IDM_SAVE     2003
@@ -1897,6 +1902,49 @@ static HBITMAP MakeRotateIcon(bool clockwise) {
 
 // Rasterize an SVG embedded as an RCDATA resource into a button HBITMAP,
 // composited over the button face color. Returns null on any failure.
+// Composite a premultiplied RGBA (s x s) buffer over the button face into an HBITMAP.
+static HBITMAP RgbaToButtonBitmap(const BYTE* rgba, int s) {
+    COLORREF face = GetSysColor(COLOR_BTNFACE);
+    BYTE fr = GetRValue(face), fg = GetGValue(face), fb = GetBValue(face);
+    HDC hdc = GetDC(nullptr);
+    BITMAPINFO bmi = {};
+    bmi.bmiHeader.biSize        = sizeof(BITMAPINFOHEADER);
+    bmi.bmiHeader.biWidth       = s;
+    bmi.bmiHeader.biHeight      = -s; // top-down
+    bmi.bmiHeader.biPlanes      = 1;
+    bmi.bmiHeader.biBitCount    = 32;
+    bmi.bmiHeader.biCompression = BI_RGB;
+    void* pBits = nullptr;
+    HBITMAP bmp = CreateDIBSection(hdc, &bmi, DIB_RGB_COLORS, &pBits, nullptr, 0);
+    if (bmp && pBits) {
+        BYTE* dst = (BYTE*)pBits;
+        for (size_t i = 0; i < (size_t)s * s; i++) {
+            BYTE r = rgba[i * 4 + 0], g = rgba[i * 4 + 1];
+            BYTE b = rgba[i * 4 + 2], a = rgba[i * 4 + 3];
+            BYTE invA = (BYTE)(255 - a);
+            dst[i * 4 + 0] = (BYTE)(b + fb * invA / 255);
+            dst[i * 4 + 1] = (BYTE)(g + fg * invA / 255);
+            dst[i * 4 + 2] = (BYTE)(r + fr * invA / 255);
+            dst[i * 4 + 3] = 255;
+        }
+    }
+    ReleaseDC(nullptr, hdc);
+    return bmp;
+}
+
+// Load a pre-rasterized icon (s x s premultiplied RGBA) from an RCDATA resource.
+// Used as a fallback where resvg is unavailable (e.g. the Win7 build).
+static HBITMAP MakeIconFromRawResource(UINT rawId, int s) {
+    HRSRC hrs = FindResourceW(g_hInst, MAKEINTRESOURCE(rawId), RT_RCDATA);
+    if (!hrs) return nullptr;
+    HGLOBAL hg = LoadResource(g_hInst, hrs);
+    if (!hg) return nullptr;
+    const BYTE* data = (const BYTE*)LockResource(hg);
+    DWORD len = SizeofResource(g_hInst, hrs);
+    if (!data || len < (DWORD)((size_t)s * s * 4)) return nullptr;
+    return RgbaToButtonBitmap(data, s);
+}
+
 static HBITMAP MakeIconFromSvgResource(UINT resId, int target) {
     HRSRC hrs = FindResourceW(g_hInst, MAKEINTRESOURCE(resId), RT_RCDATA);
     if (!hrs) return nullptr;
@@ -1924,33 +1972,7 @@ static HBITMAP MakeIconFromSvgResource(UINT resId, int target) {
     resvg_render(tree, t, (uint32_t)s, (uint32_t)s, (char*)rgba.data());
     resvg_tree_destroy(tree);
 
-    COLORREF face = GetSysColor(COLOR_BTNFACE);
-    BYTE fr = GetRValue(face), fg = GetGValue(face), fb = GetBValue(face);
-
-    HDC hdc = GetDC(nullptr);
-    BITMAPINFO bmi = {};
-    bmi.bmiHeader.biSize        = sizeof(BITMAPINFOHEADER);
-    bmi.bmiHeader.biWidth       = s;
-    bmi.bmiHeader.biHeight      = -s; // top-down
-    bmi.bmiHeader.biPlanes      = 1;
-    bmi.bmiHeader.biBitCount    = 32;
-    bmi.bmiHeader.biCompression = BI_RGB;
-    void* pBits = nullptr;
-    HBITMAP bmp = CreateDIBSection(hdc, &bmi, DIB_RGB_COLORS, &pBits, nullptr, 0);
-    if (bmp && pBits) {
-        BYTE* dst = (BYTE*)pBits;
-        for (size_t i = 0; i < (size_t)s * s; i++) {
-            BYTE r = rgba[i * 4 + 0], g = rgba[i * 4 + 1];
-            BYTE b = rgba[i * 4 + 2], a = rgba[i * 4 + 3];
-            BYTE invA = (BYTE)(255 - a);
-            dst[i * 4 + 0] = (BYTE)(b + fb * invA / 255);
-            dst[i * 4 + 1] = (BYTE)(g + fg * invA / 255);
-            dst[i * 4 + 2] = (BYTE)(r + fr * invA / 255);
-            dst[i * 4 + 3] = 255;
-        }
-    }
-    ReleaseDC(nullptr, hdc);
-    return bmp;
+    return RgbaToButtonBitmap(rgba.data(), s);
 }
 
 // A pushpin icon: round head + needle.
@@ -2375,6 +2397,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int nCmdShow) {
         0, 0, 0, 0, g_hStatusBar, (HMENU)IDC_BTN_FIT, hInstance, nullptr);
     if (g_hBtnFit) {
         g_hBtnFitBmp = MakeIconFromSvgResource(IDR_FIT, 24);
+        if (!g_hBtnFitBmp) g_hBtnFitBmp = MakeIconFromRawResource(IDR_FIT_RAW, 24);
         if (!g_hBtnFitBmp) g_hBtnFitBmp = MakeFitIcon();
     }
 
@@ -2406,10 +2429,12 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int nCmdShow) {
         tb, 0, 0, 0, 0, g_hStatusBar, (HMENU)IDC_BTN_ROTR, hInstance, nullptr);
     if (g_hBtnRotL) {
         g_hBtnRotLBmp = MakeIconFromSvgResource(IDR_ROTL, 24);
+        if (!g_hBtnRotLBmp) g_hBtnRotLBmp = MakeIconFromRawResource(IDR_ROTL_RAW, 24);
         if (!g_hBtnRotLBmp) g_hBtnRotLBmp = MakeRotateIcon(false);
     }
     if (g_hBtnRotR) {
         g_hBtnRotRBmp = MakeIconFromSvgResource(IDR_ROTR, 24);
+        if (!g_hBtnRotRBmp) g_hBtnRotRBmp = MakeIconFromRawResource(IDR_ROTR_RAW, 24);
         if (!g_hBtnRotRBmp) g_hBtnRotRBmp = MakeRotateIcon(true);
     }
 
@@ -2447,8 +2472,10 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int nCmdShow) {
         0, 0, 0, 0, g_hStatusBar, (HMENU)IDC_BTN_PIN, hInstance, nullptr);
     if (g_hBtnPin) {
         g_hBtnPinBmp = MakeIconFromSvgResource(IDR_PIN_UNFIXED, 24);
+        if (!g_hBtnPinBmp) g_hBtnPinBmp = MakeIconFromRawResource(IDR_PIN_UNFIXED_RAW, 24);
         if (!g_hBtnPinBmp) g_hBtnPinBmp = MakePinIcon();
         g_hBtnPinBmpFixed = MakeIconFromSvgResource(IDR_PIN_FIXED, 24);
+        if (!g_hBtnPinBmpFixed) g_hBtnPinBmpFixed = MakeIconFromRawResource(IDR_PIN_FIXED_RAW, 24);
         if (!g_hBtnPinBmpFixed) g_hBtnPinBmpFixed = g_hBtnPinBmp;
         ShowWindow(g_hBtnPin, SW_HIDE);
     }

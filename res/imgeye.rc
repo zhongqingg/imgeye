@@ -4,3 +4,8 @@
 103 RCDATA "icons/rotate-right.svg"
 104 RCDATA "icons/fixed.svg"
 105 RCDATA "icons/unfixed.svg"
+201 RCDATA "icons/fittowindow.rgba"
+202 RCDATA "icons/rotate-left.rgba"
+203 RCDATA "icons/rotate-right.rgba"
+204 RCDATA "icons/fixed.rgba"
+205 RCDATA "icons/unfixed.rgba"
