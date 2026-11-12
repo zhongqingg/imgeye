@@ -468,30 +468,32 @@ static bool LoadHigFile(const wchar_t* path) {
     int nHeight = rdi32(8);
     int nBits   = rdi32(12);
 
-    // Two header versions:
-    //  - Old: nType is the magic 'GIH'/'HiG', fixed 1048-byte header.
-    //  - New: nType is a version (1); the header is larger and the pixel data
-    //         always occupies the last W*H*bpp bytes of the file.
-    bool isOld = (nType == 0x484947 || nType == 0x476948);
-    bool isNew = (nType == 1);
-    if (!isOld && !isNew) return false;
+    // Three header variants observed:
+    //  - v1: nType = 'GIH'/'HiG', fixed 1048-byte header, nDataLen = W*H*bpp.
+    //  - v2: nType = 1 (version), large header, data at the end, nDataLen = 0.
+    //  - v3: nType = 'GiH' (lowercase i), large header like v2, nDataLen = 0.
+    // So: data always occupies the last W*H*bpp bytes, except the classic v1
+    // layout which uses a fixed 1048-byte header (detected via nDataLen).
+    bool knownMagic = (nType == 0x484947 || nType == 0x476948 || nType == 0x486947);
+    if (!knownMagic && nType != 1) return false;
     if (nWidth <= 0 || nHeight <= 0 || nBits <= 0 || nBits > 16) return false;
 
     int bpp = (nBits <= 8) ? 1 : 2; // 10/12/16-bit stored as 16-bit words
     size_t nPix = (size_t)nWidth * nHeight;
+    if (nPix * bpp > size) return false;
 
-    size_t dataOff = 0;
-    int nGrayStart = 0, nGrayWidth = 0;
-    if (isOld) {
-        dataOff = 1048;
-        nGrayStart = rdi32(912);
-        nGrayWidth = rdi32(916);
+    int nDataLen = rdi32(920);
+    size_t dataOff;
+    if (nDataLen > 0 && (size_t)nDataLen == nPix * bpp && 1048 + (size_t)nDataLen <= size) {
+        dataOff = 1048; // classic v1 layout with explicit data length
     } else {
-        if (nPix * bpp > size) return false;
-        dataOff = size - nPix * bpp; // new header can be larger; data is at the end
+        dataOff = size - nPix * bpp; // larger-header layouts: data at the end
         if (dataOff < 1048) return false;
     }
     if (dataOff + nPix * bpp > size) return false;
+
+    int nGrayStart = rdi32(912);
+    int nGrayWidth = rdi32(916);
 
     const BYTE* img = p + dataOff;
     std::vector<DWORD> raw(nPix);
