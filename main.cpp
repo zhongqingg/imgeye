@@ -467,17 +467,33 @@ static bool LoadHigFile(const wchar_t* path) {
     int nWidth  = rdi32(4);
     int nHeight = rdi32(8);
     int nBits   = rdi32(12);
-    int nGrayStart = rdi32(912);
-    int nGrayWidth = rdi32(916);
 
-    if (nType != 0x484947 && nType != 0x476948) return false; // 'GIH' or 'HiG'
-    if (nWidth <= 0 || nHeight <= 0 || nBits <= 0) return false;
+    // Two header versions:
+    //  - Old: nType is the magic 'GIH'/'HiG', fixed 1048-byte header.
+    //  - New: nType is a version (1); the header is larger and the pixel data
+    //         always occupies the last W*H*bpp bytes of the file.
+    bool isOld = (nType == 0x484947 || nType == 0x476948);
+    bool isNew = (nType == 1);
+    if (!isOld && !isNew) return false;
+    if (nWidth <= 0 || nHeight <= 0 || nBits <= 0 || nBits > 16) return false;
 
     int bpp = (nBits <= 8) ? 1 : 2; // 10/12/16-bit stored as 16-bit words
     size_t nPix = (size_t)nWidth * nHeight;
-    if (1048 + nPix * bpp > size) return false;
 
-    const BYTE* img = p + 1048;
+    size_t dataOff = 0;
+    int nGrayStart = 0, nGrayWidth = 0;
+    if (isOld) {
+        dataOff = 1048;
+        nGrayStart = rdi32(912);
+        nGrayWidth = rdi32(916);
+    } else {
+        if (nPix * bpp > size) return false;
+        dataOff = size - nPix * bpp; // new header can be larger; data is at the end
+        if (dataOff < 1048) return false;
+    }
+    if (dataOff + nPix * bpp > size) return false;
+
+    const BYTE* img = p + dataOff;
     std::vector<DWORD> raw(nPix);
     for (size_t i = 0; i < nPix; i++) {
         raw[i] = (bpp == 1) ? img[i] : ((WORD)img[i * 2] | ((WORD)img[i * 2 + 1] << 8));
@@ -502,7 +518,7 @@ static bool LoadHigFile(const wchar_t* path) {
     CloseImage();
     g_isHig = true;
     g_higWinWidth = maxVal; // default full-range display
-    g_higHeader.assign(data.begin(), data.begin() + 1048);
+    g_higHeader.assign(data.begin(), data.begin() + dataOff);
     g_realBits = nBits;
     g_realMax = maxVal;
     g_realGray = std::move(raw);
@@ -2215,7 +2231,7 @@ static bool SaveImageFile(const wchar_t* path) {
         HANDLE h = CreateFileW(path, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, 0, nullptr);
         if (h == INVALID_HANDLE_VALUE) return false;
         DWORD wr = 0;
-        BOOL ok = WriteFile(h, hdr.data(), 1048, &wr, nullptr);
+        BOOL ok = WriteFile(h, hdr.data(), (DWORD)hdr.size(), &wr, nullptr);
         if (ok && !payload.empty()) ok = WriteFile(h, payload.data(), (DWORD)payload.size(), &wr, nullptr);
         CloseHandle(h);
         return ok != FALSE;
